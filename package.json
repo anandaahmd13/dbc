@@ -15,6 +15,7 @@
     "dev": "tsx src/index.ts",
     "inspect": "tsx src/scripts/inspect-mint.ts",
     "test-latest": "tsx src/scripts/test-latest.ts",
+    "diagnose": "tsx src/scripts/diagnose.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
