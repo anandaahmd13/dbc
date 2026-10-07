@@ -131,6 +131,13 @@ export class Db {
     return res.changes > 0;
   }
 
+  /** Most recent launches the bot has recorded (eligible or not). */
+  recentLaunches(limit = 10): LaunchRow[] {
+    return this.raw
+      .prepare("SELECT * FROM launches ORDER BY detected_at DESC LIMIT ?")
+      .all(limit) as LaunchRow[];
+  }
+
   activeLaunches(now: number): LaunchRow[] {
     return this.raw
       .prepare("SELECT * FROM launches WHERE eligible = 1 AND watch_until > ? ORDER BY detected_at ASC")

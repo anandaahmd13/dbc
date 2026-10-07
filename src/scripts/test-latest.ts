@@ -1,19 +1,33 @@
 import { Connection } from "@solana/web3.js";
 import { loadConfig } from "../config.js";
+import { Db } from "../db.js";
 import { DbcClient, DBC_PROGRAM_ID, decodeInitializePoolEvents } from "../solana/dbc.js";
 import { fetchOrders, fetchTokenInfo } from "../dexscreener/client.js";
 import { TelegramClient, escapeHtml, clampMessage } from "../telegram.js";
 
+interface Launch {
+  pool: string;
+  baseMint: string;
+  creator: string;
+  signature: string;
+}
+
 /**
- * One-shot test: find the most recent DBC launch on-chain, gather its DEX
- * Screener state, and send ONE labelled TEST message to Telegram.
+ * One-shot test: take the latest DBC launch and send ONE labelled TEST message
+ * to Telegram.
  *
- * Sends a real message regardless of DRY_RUN (that is the point of the test),
- * but requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to be set.
+ * Source of "latest":
+ *   - default: the most recent launch the running bot has recorded in SQLite.
+ *   - --scan : scan up to 500 recent program txs on-chain (slower; use when the
+ *              DB is empty, e.g. the bot just started).
+ *
+ * Sends a real message regardless of DRY_RUN (that is the point of the test).
  *
  *   npm run test-latest
+ *   npm run test-latest -- --scan
  */
 async function main() {
+  const scan = process.argv.includes("--scan");
   const cfg = loadConfig(false);
   if (!cfg.telegramBotToken || !cfg.telegramChatId) {
     console.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env first.");
@@ -23,30 +37,47 @@ async function main() {
   const connection = new Connection(cfg.heliusRpcUrl, "confirmed");
   const dbc = new DbcClient(connection);
 
-  console.log("scanning recent DBC program transactions for the latest launch…");
-  const sigs = await connection.getSignaturesForAddress(DBC_PROGRAM_ID, { limit: 100 });
+  let found: Launch | null = null;
 
-  let found: { pool: string; baseMint: string; creator: string; signature: string } | null = null;
-  for (const s of sigs) {
-    if (s.err) continue;
-    const tx = await connection.getTransaction(s.signature, {
-      maxSupportedTransactionVersion: 2,
-      commitment: "confirmed",
-    });
-    const logs = tx?.meta?.logMessages ?? [];
-    const events = decodeInitializePoolEvents(dbc.program as any, logs);
-    if (events.length > 0) {
-      found = { ...events[0]!, signature: s.signature };
-      break; // signatures are newest-first, so the first match is the latest launch
+  if (!scan) {
+    const db = new Db(cfg.databasePath);
+    const rows = db.recentLaunches(1);
+    db.close();
+    if (rows.length > 0) {
+      const r = rows[0]!;
+      found = { pool: r.pool, baseMint: r.base_mint, creator: r.creator, signature: r.signature ?? "" };
+      console.log("latest launch (from bot DB):", found);
+    } else {
+      console.log("bot DB has no launches yet; falling back to on-chain scan…");
     }
   }
 
   if (!found) {
-    console.error("No InitializePool event found in the last 100 txs. Try again later.");
-    process.exit(1);
+    console.log("scanning recent DBC program transactions for the latest launch…");
+    const sigs = await connection.getSignaturesForAddress(DBC_PROGRAM_ID, { limit: 500 });
+    let scanned = 0;
+    for (const s of sigs) {
+      if (s.err) continue;
+      scanned++;
+      const tx = await connection.getTransaction(s.signature, {
+        maxSupportedTransactionVersion: 2,
+        commitment: "confirmed",
+      });
+      const logs = tx?.meta?.logMessages ?? [];
+      const events = decodeInitializePoolEvents(dbc.program as any, logs);
+      if (events.length > 0) {
+        found = { ...events[0]!, signature: s.signature };
+        break;
+      }
+      if (scanned % 50 === 0) console.log(`  …scanned ${scanned} txs`);
+    }
+    if (found) console.log("latest launch (on-chain):", found);
   }
 
-  console.log("latest launch:", found);
+  if (!found) {
+    console.error("No launch found. The bot may not have seen one yet — let it run, or try --scan.");
+    process.exit(1);
+  }
 
   // Eligibility (best-effort; unknown if RPC can't enumerate).
   let launchCount: number | null = null;
