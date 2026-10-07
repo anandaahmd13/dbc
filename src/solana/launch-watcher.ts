@@ -10,6 +10,11 @@ export interface DetectedLaunch {
 }
 
 const CURSOR_NAME = "launch_last_signature";
+const MAX_BACKFILL = 300;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 interface CursorStore {
   getCursor(name: string): string | null;
@@ -75,11 +80,26 @@ export class LaunchWatcher {
       return;
     }
     if (sigs.length === 0) return;
+
+    // Cap replay: a large gap (long downtime / very active program) would mean
+    // thousands of getTransaction calls and hammer the RPC. Live subscription
+    // covers new launches anyway, so only replay a bounded recent slice and
+    // fast-forward the cursor past the rest.
+    if (sigs.length > MAX_BACKFILL) {
+      const newest = sigs[0]?.signature ?? null;
+      log.warn(
+        `backfill gap of ${sigs.length} > ${MAX_BACKFILL}; skipping replay and fast-forwarding cursor`
+      );
+      this.cursor.setCursor(CURSOR_NAME, newest);
+      return;
+    }
+
     log.info(`backfilling ${sigs.length} signature(s) since cursor`);
     // API returns newest-first; process oldest-first so the cursor advances safely.
     for (const s of sigs.reverse()) {
       if (s.err) continue;
       await this.processSignature(s.signature);
+      await sleep(120); // gentle throttle to stay under RPC limits
     }
   }
 
@@ -132,7 +152,7 @@ export class LaunchWatcher {
   private async processSignature(signature: string): Promise<void> {
     try {
       const tx = await this.connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 2,
         commitment: "confirmed",
       });
       const logs = tx?.meta?.logMessages ?? [];
