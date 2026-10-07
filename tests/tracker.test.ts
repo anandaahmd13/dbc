@@ -191,17 +191,44 @@ describe("seedBaseline", () => {
     });
   }
 
-  it("records orders+socials silently and marks baseline done", async () => {
+  const approved = async () => [
+    { type: PROFILE_ORDER_TYPE, status: "approved", paymentTimestamp: 1 },
+  ];
+
+  it("live launch: socials baselined silently, orders left alone so a $299 order still alerts", async () => {
     const db = new Db(":memory:");
     launch(db);
     const ok = await seedBaseline(deps(db), "m", {
-      fetchOrders: async () => [{ type: PROFILE_ORDER_TYPE, status: "approved", paymentTimestamp: 1 }],
+      origin: "live",
+      fetchOrders: approved,
       fetchInfo: async () => new Map([["m", present()]]),
     });
     expect(ok).toBe(true);
     expect(db.getLaunchByMint("m")!.baseline_done).toBe(1);
-    expect(db.getOrders("m")).toHaveLength(1);
     expect(db.getSnapshot("m")).toBeDefined();
+    expect(db.getOrders("m")).toHaveLength(0); // orders NOT baselined for live launches
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
+
+    // The order is then read by the normal poll and alerts exactly once.
+    await pollOrders(deps(db), "m", approved);
+    await pollOrders(deps(db), "m", approved);
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(1);
+    db.close();
+  });
+
+  it("backfilled launch: existing order is recorded silently (may predate us)", async () => {
+    const db = new Db(":memory:");
+    launch(db);
+    const ok = await seedBaseline(deps(db), "m", {
+      origin: "backfill",
+      fetchOrders: approved,
+      fetchInfo: async () => new Map([["m", present()]]),
+    });
+    expect(ok).toBe(true);
+    expect(db.getOrders("m")).toHaveLength(1);
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
+
+    await pollOrders(deps(db), "m", approved); // same order again -> still silent
     expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
     db.close();
   });

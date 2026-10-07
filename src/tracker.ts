@@ -215,11 +215,18 @@ export async function pollSocials(
 }
 
 /**
- * Silent baseline pass for one launch: record current orders + socials without
- * alerting, then mark the launch's baseline done. If DEX Screener has no pair
- * data for the mint yet, the baseline is NOT marked done (retried next cycle) —
- * otherwise the first real appearance would be mistaken for "already existed"
- * or, worse, for a change.
+ * Silent baseline pass for one launch.
+ *
+ * Socials are always recorded silently first: a live launch's initial socials
+ * are the starting state, and only later edits are "updates".
+ *
+ * Orders are different. A token seen live at launch cannot have paid before we
+ * watched it, so any tokenProfile order we read is new and must alert — it is
+ * NOT baselined. Only `origin: "backfill"` launches (which may have paid before
+ * we started watching) record orders silently.
+ *
+ * If DEX Screener has no pair data for the mint yet, the baseline is NOT marked
+ * done (retried next cycle) so the first appearance is not mistaken for a change.
  *
  * Returns true when the baseline was completed.
  */
@@ -229,9 +236,12 @@ export async function seedBaseline(
   fns: {
     fetchOrders?: (m: string) => Promise<OrderEntry[]>;
     fetchInfo?: (m: string[]) => Promise<Map<string, TokenInfo>>;
+    origin?: string;
   } = {}
 ): Promise<boolean> {
-  await pollOrders(deps, mint, fns.fetchOrders ?? fetchOrders, { silent: true });
+  if (fns.origin === "backfill") {
+    await pollOrders(deps, mint, fns.fetchOrders ?? fetchOrders, { silent: true });
+  }
   const seen = await pollSocials(deps, [mint], fns.fetchInfo ?? fetchTokenInfo, { silent: true });
   if (!seen.includes(mint)) return false;
   deps.db.setBaselineDone(mint);

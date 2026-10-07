@@ -61,15 +61,16 @@ describe("Db launches + creators", () => {
 });
 
 describe("Db migrations", () => {
-  it("applies 001 + 002 once and exposes baseline_done", () => {
+  it("applies all migrations once and exposes baseline_done/origin", () => {
     const db = mem();
     const applied = db.raw.prepare("SELECT name FROM schema_migrations ORDER BY name").all() as { name: string }[];
-    expect(applied.map((r) => r.name)).toEqual(["001-init.sql", "002-baseline.sql"]);
+    expect(applied.map((r) => r.name)).toEqual(["001-init.sql", "002-baseline.sql", "003-launch-origin.sql"]);
     db.insertLaunch({
       pool: "p", base_mint: "m", creator: "c", signature: null,
       detected_at: 1, watch_until: Date.now() + 1000, eligible: true,
     });
     expect(db.getLaunchByMint("m")!.baseline_done).toBe(0);
+    expect(db.getLaunchByMint("m")!.origin).toBe("live");
     db.setBaselineDone("m");
     expect(db.getLaunchByMint("m")!.baseline_done).toBe(1);
     db.close();

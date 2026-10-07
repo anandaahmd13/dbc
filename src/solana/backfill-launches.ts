@@ -100,6 +100,7 @@ export async function backfillRecentLaunches(
           detected_at: launchedAt,
           watch_until: watchUntil,
           eligible,
+          origin: "backfill",
         });
         if (inserted && eligible) tracked++;
       }

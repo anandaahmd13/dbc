@@ -24,6 +24,7 @@ export interface LaunchRow {
   watch_until: number;
   eligible: number;
   baseline_done: number;
+  origin: string;
 }
 
 export interface SnapshotRow {
@@ -157,15 +158,18 @@ export class Db {
   }
 
   insertLaunch(
-    row: Omit<LaunchRow, "eligible" | "baseline_done"> & { eligible: boolean }
+    row: Omit<LaunchRow, "eligible" | "baseline_done" | "origin"> & {
+      eligible: boolean;
+      origin?: "live" | "backfill";
+    }
   ): boolean {
     const res = this.raw
       .prepare(
         `INSERT OR IGNORE INTO launches
-         (pool, base_mint, creator, signature, detected_at, watch_until, eligible)
-         VALUES (@pool, @base_mint, @creator, @signature, @detected_at, @watch_until, @eligible)`
+         (pool, base_mint, creator, signature, detected_at, watch_until, eligible, origin)
+         VALUES (@pool, @base_mint, @creator, @signature, @detected_at, @watch_until, @eligible, @origin)`
       )
-      .run({ ...row, eligible: row.eligible ? 1 : 0 });
+      .run({ ...row, eligible: row.eligible ? 1 : 0, origin: row.origin ?? "live" });
     return res.changes > 0;
   }
 

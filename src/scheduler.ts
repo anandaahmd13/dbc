@@ -87,10 +87,16 @@ export class PollScheduler {
         continue;
       }
       await this.cycleBaselines(active);
-      // Only launches whose silent baseline is recorded get change-alerting polls.
-      const ready = this.db.activeLaunches(Date.now()).filter((l) => l.baseline_done === 1);
-      await this.cycleSocials(ready, now);
-      await this.cycleOrders(ready, now);
+      const current = this.db.activeLaunches(Date.now());
+      // Socials alert only on changes, so they wait for the silent baseline.
+      await this.cycleSocials(current.filter((l) => l.baseline_done === 1), now);
+      // Orders need no baseline for live launches: such a token cannot have paid
+      // before we watched it, so any tokenProfile order we read is new. Backfilled
+      // launches still wait, since they may have paid before we started.
+      await this.cycleOrders(
+        current.filter((l) => l.origin === "live" || l.baseline_done === 1),
+        now
+      );
       await sleep(1000);
     }
   }
@@ -112,7 +118,7 @@ export class PollScheduler {
       await this.ordersRl.acquire();
       await this.tokensRl.acquire();
       try {
-        const done = await seedBaseline(this.deps, l.base_mint);
+        const done = await seedBaseline(this.deps, l.base_mint, { origin: l.origin });
         if (!done) {
           log.debug(`baseline pending (no DEX Screener data yet): ${l.base_mint}`);
           this.nextBaselineTry.set(l.base_mint, Date.now() + this.cfg.pollIntervalMs);
