@@ -55,8 +55,21 @@ async function get(path: string): Promise<unknown> {
  */
 export async function fetchOrders(mint: string, chain = "solana"): Promise<OrderEntry[]> {
   const data = await get(`/orders/v1/${chain}/${encodeURIComponent(mint)}`);
-  if (!Array.isArray(data)) return [];
-  return data
+  return parseOrders(data);
+}
+
+/**
+ * The live endpoint returns `{ orders: [...], boosts: [...] }`; older docs show
+ * a bare array. Accept both. Anything else yields no orders.
+ */
+export function parseOrders(data: unknown): OrderEntry[] {
+  const list: unknown = Array.isArray(data)
+    ? data
+    : data && typeof data === "object"
+      ? (data as Record<string, unknown>).orders
+      : undefined;
+  if (!Array.isArray(list)) return [];
+  return list
     .filter((d): d is Record<string, unknown> => !!d && typeof d === "object")
     .map((d) => ({
       type: String(d.type ?? ""),

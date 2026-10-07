@@ -11,6 +11,8 @@ export interface Config {
   databasePath: string;
   ordersRpm: number;
   tokensRpm: number;
+  /** Max txs the startup backfill may inspect; 0 disables it (default). */
+  backfillMaxTx: number;
 }
 
 function str(name: string, fallback?: string): string {
@@ -60,6 +62,7 @@ export function loadConfig(requireSecrets = true): Config {
     databasePath: optStr("DATABASE_PATH", "./data/tracker.db"),
     ordersRpm: num("ORDERS_RPM", 50),
     tokensRpm: num("TOKENS_RPM", 240),
+    backfillMaxTx: num("BACKFILL_MAX_TX", 0),
   };
 }
 

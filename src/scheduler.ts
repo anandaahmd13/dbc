@@ -1,6 +1,6 @@
 import type { Db, LaunchRow } from "./db.js";
 import type { TrackerDeps } from "./tracker.js";
-import { pollOrders, pollSocials } from "./tracker.js";
+import { pollOrders, pollSocials, seedBaseline } from "./tracker.js";
 import { DexScreenerError } from "./dexscreener/client.js";
 import { log } from "./logger.js";
 
@@ -44,6 +44,8 @@ export class RateLimiter {
   }
 }
 
+const MAX_BASELINES_PER_PASS = 5;
+
 export interface SchedulerConfig {
   ordersRpm: number;
   tokensRpm: number;
@@ -60,6 +62,7 @@ export class PollScheduler {
   private tokensRl: RateLimiter;
   private stopped = false;
   private readonly nextOrderPoll = new Map<string, number>();
+  private readonly nextBaselineTry = new Map<string, number>();
   private lastSocialCycle = 0;
 
   constructor(
@@ -83,9 +86,41 @@ export class PollScheduler {
         await sleep(2000);
         continue;
       }
-      await this.cycleSocials(active, now);
-      await this.cycleOrders(active, now);
+      await this.cycleBaselines(active);
+      // Only launches whose silent baseline is recorded get change-alerting polls.
+      const ready = this.db.activeLaunches(Date.now()).filter((l) => l.baseline_done === 1);
+      await this.cycleSocials(ready, now);
+      await this.cycleOrders(ready, now);
       await sleep(1000);
+    }
+  }
+
+  /**
+   * Record the silent baseline (orders + socials, no alerts) for launches that
+   * lack one. A launch whose pair isn't indexed by DEX Screener yet stays
+   * un-baselined and is retried after a delay.
+   */
+  private async cycleBaselines(active: LaunchRow[]): Promise<void> {
+    // Cap per loop pass so a big backfill can't starve change-polling of tokens
+    // that are already baselined; remaining launches are picked up next pass.
+    let budget = MAX_BASELINES_PER_PASS;
+    for (const l of active) {
+      if (this.stopped || budget <= 0) return;
+      if (l.baseline_done === 1) continue;
+      if ((this.nextBaselineTry.get(l.base_mint) ?? 0) > Date.now()) continue;
+      budget--;
+      await this.ordersRl.acquire();
+      await this.tokensRl.acquire();
+      try {
+        const done = await seedBaseline(this.deps, l.base_mint);
+        if (!done) {
+          log.debug(`baseline pending (no DEX Screener data yet): ${l.base_mint}`);
+          this.nextBaselineTry.set(l.base_mint, Date.now() + this.cfg.pollIntervalMs);
+        }
+      } catch (err) {
+        const backoff = this.handleDexErr("baseline", err);
+        this.nextBaselineTry.set(l.base_mint, Date.now() + backoff);
+      }
     }
   }
 

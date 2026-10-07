@@ -6,10 +6,12 @@ import {
   infoToSnapshotRow,
   pollOrders,
   pollSocials,
+  seedBaseline,
   PROFILE_ORDER_TYPE,
   type TrackerDeps,
 } from "../src/tracker.js";
 import type { TokenInfo, OrderEntry } from "../src/dexscreener/client.js";
+import { parseOrders } from "../src/dexscreener/client.js";
 
 function deps(db: Db): TrackerDeps {
   return {
@@ -84,27 +86,46 @@ describe("diffOrders", () => {
 });
 
 describe("pollOrders", () => {
-  it("baseline then transition enqueues deduped events", async () => {
+  const stub = (status: string): ((m: string) => Promise<OrderEntry[]>) =>
+    async () => [{ type: PROFILE_ORDER_TYPE, status, paymentTimestamp: 7 }];
+
+  it("silent pass records state but never alerts", async () => {
     const db = new Db(":memory:");
     const d = deps(db);
-    const stub = (status: string): ((m: string) => Promise<OrderEntry[]>) =>
-      async () => [{ type: PROFILE_ORDER_TYPE, status, paymentTimestamp: 7 }];
+    const r = await pollOrders(d, "m", stub("approved"), { silent: true });
+    expect(r.baseline).toBe(true);
+    expect(db.getOrders("m")).toHaveLength(1);
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
+    db.close();
+  });
 
-    const r1 = await pollOrders(d, "m", stub("processing"));
-    expect(r1.baseline).toBe(true);
-    expect(r1.changes).toHaveLength(1);
+  it("after baseline: pre-existing approved order is NOT alerted, a transition IS (once)", async () => {
+    const db = new Db(":memory:");
+    const d = deps(db);
+    await pollOrders(d, "m", stub("processing"), { silent: true }); // baseline
 
-    // same status again -> no new event
-    const r2 = await pollOrders(d, "m", stub("processing"));
-    expect(r2.changes).toHaveLength(0);
+    // same status -> nothing
+    expect((await pollOrders(d, "m", stub("processing"))).changes).toHaveLength(0);
 
-    // transition -> new event
-    const r3 = await pollOrders(d, "m", stub("approved"));
-    expect(r3.changes).toHaveLength(1);
-    expect(r3.changes[0]!.previousStatus).toBe("processing");
+    // processing -> approved ($299 paid) -> exactly one alert
+    const r = await pollOrders(d, "m", stub("approved"));
+    expect(r.changes).toHaveLength(1);
+    expect(r.changes[0]!.previousStatus).toBe("processing");
 
-    const pending = db.claimPendingOutbox(Date.now(), 50);
-    expect(pending).toHaveLength(2); // one per real change
+    // repeat poll, no further change -> still one alert total
+    await pollOrders(d, "m", stub("approved"));
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(1);
+    db.close();
+  });
+
+  it("brand-new tokenProfile order after an empty baseline is alerted", async () => {
+    const db = new Db(":memory:");
+    const d = deps(db);
+    await pollOrders(d, "m", async () => [], { silent: true }); // baseline: no orders
+    const r = await pollOrders(d, "m", stub("approved"));
+    expect(r.changes).toHaveLength(1);
+    expect(r.changes[0]!.previousStatus).toBeUndefined();
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(1);
     db.close();
   });
 });
@@ -113,31 +134,114 @@ describe("pollSocials", () => {
   it("absent response is not treated as removal", async () => {
     const db = new Db(":memory:");
     const d = deps(db);
-    // baseline with a website
     await pollSocials(d, ["m"], async () =>
-      new Map([["m", emptyInfo({ hasInfo: true, websites: ["https://a"] })]])
+      new Map([["m", emptyInfo({ hasInfo: true, websites: ["https://a"] })]]), { silent: true }
     );
-    // next poll: mint absent (present=false) -> must NOT enqueue a removal
-    await pollSocials(d, ["m"], async () =>
+    const seen = await pollSocials(d, ["m"], async () =>
       new Map([["m", { present: false, hasInfo: false, websites: [], socials: [] }]])
     );
-    const snap = db.getSnapshot("m");
-    expect(JSON.parse(snap!.websites_json)).toEqual(["https://a"]); // unchanged
+    expect(seen).toEqual([]); // not reported as seen
+    expect(JSON.parse(db.getSnapshot("m")!.websites_json)).toEqual(["https://a"]);
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
     db.close();
   });
 
-  it("empty baseline (no info) does not alert, later real add does", async () => {
+  it("silent baseline with existing socials does not alert; later change does", async () => {
     const db = new Db(":memory:");
     const d = deps(db);
     await pollSocials(d, ["m"], async () =>
-      new Map([["m", emptyInfo({ hasInfo: false })]])
+      new Map([["m", emptyInfo({ hasInfo: true, websites: ["https://a"], socials: [{ type: "twitter", url: "x1" }] })]]),
+      { silent: true }
     );
     expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
 
+    // unchanged -> no alert
+    await pollSocials(d, ["m"], async () =>
+      new Map([["m", emptyInfo({ hasInfo: true, websites: ["https://a"], socials: [{ type: "twitter", url: "x1" }] })]])
+    );
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
+
+    // telegram added -> one alert
+    await pollSocials(d, ["m"], async () =>
+      new Map([["m", emptyInfo({ hasInfo: true, websites: ["https://a"], socials: [{ type: "twitter", url: "x1" }, { type: "telegram", url: "tg1" }] })]])
+    );
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(1);
+    db.close();
+  });
+
+  it("empty baseline then first socials appear -> alerted as a change", async () => {
+    const db = new Db(":memory:");
+    const d = deps(db);
+    await pollSocials(d, ["m"], async () => new Map([["m", emptyInfo({ hasInfo: false })]]), { silent: true });
     await pollSocials(d, ["m"], async () =>
       new Map([["m", emptyInfo({ hasInfo: true, websites: ["https://x"] })]])
     );
     expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(1);
     db.close();
+  });
+});
+
+describe("seedBaseline", () => {
+  const present = (over: Partial<TokenInfo> = {}) => emptyInfo({ hasInfo: true, websites: ["https://a"], ...over });
+
+  function launch(db: Db) {
+    db.insertLaunch({
+      pool: "p", base_mint: "m", creator: "c", signature: null,
+      detected_at: Date.now(), watch_until: Date.now() + 60_000, eligible: true,
+    });
+  }
+
+  it("records orders+socials silently and marks baseline done", async () => {
+    const db = new Db(":memory:");
+    launch(db);
+    const ok = await seedBaseline(deps(db), "m", {
+      fetchOrders: async () => [{ type: PROFILE_ORDER_TYPE, status: "approved", paymentTimestamp: 1 }],
+      fetchInfo: async () => new Map([["m", present()]]),
+    });
+    expect(ok).toBe(true);
+    expect(db.getLaunchByMint("m")!.baseline_done).toBe(1);
+    expect(db.getOrders("m")).toHaveLength(1);
+    expect(db.getSnapshot("m")).toBeDefined();
+    expect(db.claimPendingOutbox(Date.now(), 50)).toHaveLength(0);
+    db.close();
+  });
+
+  it("does NOT mark done when DEX Screener has no pair data yet", async () => {
+    const db = new Db(":memory:");
+    launch(db);
+    const ok = await seedBaseline(deps(db), "m", {
+      fetchOrders: async () => [],
+      fetchInfo: async () => new Map([["m", { present: false, hasInfo: false, websites: [], socials: [] }]]),
+    });
+    expect(ok).toBe(false);
+    expect(db.getLaunchByMint("m")!.baseline_done).toBe(0);
+    db.close();
+  });
+});
+
+describe("parseOrders", () => {
+  it("parses the live { orders, boosts } shape (BVNH tokenProfile approved)", () => {
+    const live = {
+      orders: [
+        { chainId: "solana", tokenAddress: "BVNH", type: "tokenProfile", status: "approved", paymentTimestamp: 1791384517536 },
+      ],
+      boosts: [],
+    };
+    expect(parseOrders(live)).toEqual([
+      { type: "tokenProfile", status: "approved", paymentTimestamp: 1791384517536 },
+    ]);
+  });
+
+  it("still accepts a bare array", () => {
+    expect(parseOrders([{ type: "tokenProfile", status: "processing" }])).toEqual([
+      { type: "tokenProfile", status: "processing", paymentTimestamp: undefined },
+    ]);
+  });
+
+  it("returns [] for junk", () => {
+    expect(parseOrders(null)).toEqual([]);
+    expect(parseOrders({})).toEqual([]);
+    expect(parseOrders({ orders: "nope" })).toEqual([]);
+    expect(parseOrders("x")).toEqual([]);
   });
 });

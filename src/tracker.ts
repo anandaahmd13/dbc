@@ -112,18 +112,28 @@ export interface TrackerDeps {
   formatOrder: (mint: string, change: OrderChange, baseline: boolean) => string;
 }
 
+export interface PollOpts {
+  /** Record state without enqueueing alerts (used for the baseline pass). */
+  silent?: boolean;
+}
+
 /**
  * Poll a single mint's orders and persist/diff. Pure of network concerns except
- * the two injected fetchers (so tests can stub). Enqueues alerts atomically.
+ * the injected fetcher (so tests can stub). Enqueues alerts atomically unless
+ * `opts.silent` (baseline pass), in which case state is recorded quietly.
+ *
+ * Outside the baseline pass every difference is a real change after we started
+ * watching, so alerts are never flagged as "first seen".
  */
 export async function pollOrders(
   deps: TrackerDeps,
   mint: string,
-  fetchOrdersFn: (m: string) => Promise<OrderEntry[]> = fetchOrders
+  fetchOrdersFn: (m: string) => Promise<OrderEntry[]> = fetchOrders,
+  opts: PollOpts = {}
 ): Promise<{ changes: OrderChange[]; baseline: boolean }> {
   const fresh = await fetchOrdersFn(mint);
   const stored = deps.db.getOrders(mint);
-  const baseline = stored.length === 0;
+  const baseline = Boolean(opts.silent);
   const changes = diffOrders(stored, fresh);
   const now = Date.now();
 
@@ -138,6 +148,8 @@ export async function pollOrders(
     });
   }
 
+  if (opts.silent) return { changes, baseline };
+
   for (const c of changes) {
     const key = eventKey([
       "order",
@@ -150,40 +162,43 @@ export async function pollOrders(
       eventKey: key,
       baseMint: mint,
       kind: "order",
-      text: deps.formatOrder(mint, c, baseline),
+      text: deps.formatOrder(mint, c, false),
     });
   }
   return { changes, baseline };
 }
 
 /**
- * Poll social info for a batch of mints (<=30), diff + enqueue.
+ * Poll social info for a batch of mints (<=30), diff + enqueue. With
+ * `opts.silent` (baseline pass) snapshots are recorded without alerts.
+ * Returns the mints whose DEX Screener data was actually present, so the caller
+ * can tell which baselines are safe to mark done.
  */
 export async function pollSocials(
   deps: TrackerDeps,
   mints: string[],
-  fetchInfoFn: (m: string[]) => Promise<Map<string, TokenInfo>> = fetchTokenInfo
-): Promise<void> {
-  if (mints.length === 0) return;
+  fetchInfoFn: (m: string[]) => Promise<Map<string, TokenInfo>> = fetchTokenInfo,
+  opts: PollOpts = {}
+): Promise<string[]> {
+  if (mints.length === 0) return [];
   const infos = await fetchInfoFn(mints);
   const now = Date.now();
+  const seen: string[] = [];
 
   for (const mint of mints) {
     const info = infos.get(mint);
     if (!info || !info.present) continue; // absent response != removal
+    seen.push(mint);
 
     const prev = deps.db.getSnapshot(mint);
-    const baseline = prev === undefined;
     const diff = diffSocials(prev, info);
     deps.db.upsertSnapshot(infoToSnapshotRow(mint, info, now));
 
-    if (!diff) continue;
-    if (baseline && !info.hasInfo) continue; // nothing to announce on an empty baseline
+    if (opts.silent || !diff) continue;
 
     const key = eventKey([
       "social",
       mint,
-      baseline ? "baseline" : "change",
       JSON.stringify(diff.websitesAdded),
       JSON.stringify(diff.websitesRemoved),
       JSON.stringify(diff.socialsAdded.map((s) => s.url)),
@@ -193,7 +208,32 @@ export async function pollSocials(
       eventKey: key,
       baseMint: mint,
       kind: "social",
-      text: deps.formatSocial(mint, diff, baseline, info),
+      text: deps.formatSocial(mint, diff, false, info),
     });
   }
+  return seen;
+}
+
+/**
+ * Silent baseline pass for one launch: record current orders + socials without
+ * alerting, then mark the launch's baseline done. If DEX Screener has no pair
+ * data for the mint yet, the baseline is NOT marked done (retried next cycle) —
+ * otherwise the first real appearance would be mistaken for "already existed"
+ * or, worse, for a change.
+ *
+ * Returns true when the baseline was completed.
+ */
+export async function seedBaseline(
+  deps: TrackerDeps,
+  mint: string,
+  fns: {
+    fetchOrders?: (m: string) => Promise<OrderEntry[]>;
+    fetchInfo?: (m: string[]) => Promise<Map<string, TokenInfo>>;
+  } = {}
+): Promise<boolean> {
+  await pollOrders(deps, mint, fns.fetchOrders ?? fetchOrders, { silent: true });
+  const seen = await pollSocials(deps, [mint], fns.fetchInfo ?? fetchTokenInfo, { silent: true });
+  if (!seen.includes(mint)) return false;
+  deps.db.setBaselineDone(mint);
+  return true;
 }

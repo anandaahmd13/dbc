@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +23,7 @@ export interface LaunchRow {
   detected_at: number;
   watch_until: number;
   eligible: number;
+  baseline_done: number;
 }
 
 export interface SnapshotRow {
@@ -66,9 +67,39 @@ export class Db {
     this.migrate();
   }
 
+  /**
+   * Run every `migrations/*.sql` once, in filename order, tracked in
+   * `schema_migrations`. 001 is `IF NOT EXISTS`-only so it is safe to re-run on
+   * databases created before tracking existed; later files (ALTER TABLE) are not
+   * idempotent and rely on the tracking table.
+   */
   private migrate() {
-    const sql = readFileSync(resolve(__dirname, "migrations/001-init.sql"), "utf8");
-    this.raw.exec(sql);
+    this.raw.exec(
+      `CREATE TABLE IF NOT EXISTS schema_migrations (
+         name TEXT PRIMARY KEY,
+         applied_at INTEGER NOT NULL
+       )`
+    );
+    const dir = resolve(__dirname, "migrations");
+    const files = readdirSync(dir)
+      .filter((f) => f.endsWith(".sql"))
+      .sort();
+    const applied = new Set(
+      (this.raw.prepare("SELECT name FROM schema_migrations").all() as { name: string }[]).map(
+        (r) => r.name
+      )
+    );
+    for (const file of files) {
+      if (applied.has(file)) continue;
+      const sql = readFileSync(resolve(dir, file), "utf8");
+      const run = this.raw.transaction(() => {
+        this.raw.exec(sql);
+        this.raw
+          .prepare("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)")
+          .run(file, Date.now());
+      });
+      run();
+    }
   }
 
   // --- cursors ---
@@ -120,7 +151,14 @@ export class Db {
       | undefined;
   }
 
-  insertLaunch(row: Omit<LaunchRow, "eligible"> & { eligible: boolean }): boolean {
+  /** Mark the silent baseline pass as done so later polls alert on changes. */
+  setBaselineDone(mint: string): void {
+    this.raw.prepare("UPDATE launches SET baseline_done = 1 WHERE base_mint = ?").run(mint);
+  }
+
+  insertLaunch(
+    row: Omit<LaunchRow, "eligible" | "baseline_done"> & { eligible: boolean }
+  ): boolean {
     const res = this.raw
       .prepare(
         `INSERT OR IGNORE INTO launches

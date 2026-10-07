@@ -59,3 +59,49 @@ describe("Db launches + creators", () => {
     db.close();
   });
 });
+
+describe("Db migrations", () => {
+  it("applies 001 + 002 once and exposes baseline_done", () => {
+    const db = mem();
+    const applied = db.raw.prepare("SELECT name FROM schema_migrations ORDER BY name").all() as { name: string }[];
+    expect(applied.map((r) => r.name)).toEqual(["001-init.sql", "002-baseline.sql"]);
+    db.insertLaunch({
+      pool: "p", base_mint: "m", creator: "c", signature: null,
+      detected_at: 1, watch_until: Date.now() + 1000, eligible: true,
+    });
+    expect(db.getLaunchByMint("m")!.baseline_done).toBe(0);
+    db.setBaselineDone("m");
+    expect(db.getLaunchByMint("m")!.baseline_done).toBe(1);
+    db.close();
+  });
+
+  it("upgrades a pre-tracking database (001 already applied, no schema_migrations)", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { readFileSync } = await import("node:fs");
+    const Database = (await import("better-sqlite3")).default;
+
+    const dir = mkdtempSync(join(tmpdir(), "dbc-mig-"));
+    const path = join(dir, "old.db");
+    try {
+      // Simulate the production DB created before migration tracking existed.
+      const old = new Database(path);
+      old.exec(readFileSync(join(process.cwd(), "src/migrations/001-init.sql"), "utf8"));
+      old.prepare(
+        "INSERT INTO launches (pool, base_mint, creator, detected_at, watch_until, eligible) VALUES ('p','m','c',1,2,1)"
+      ).run();
+      old.close();
+
+      const db = new Db(path);
+      expect(db.getLaunchByMint("m")!.baseline_done).toBe(0); // existing row gets default
+      db.close();
+
+      const again = new Db(path); // second open must not re-run ALTER TABLE
+      expect(again.getLaunchByMint("m")).toBeDefined();
+      again.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -4,6 +4,7 @@ import { Db } from "./db.js";
 import { DbcClient } from "./solana/dbc.js";
 import { LaunchWatcher, type DetectedLaunch } from "./solana/launch-watcher.js";
 import { evaluateCreator } from "./solana/creator-history.js";
+import { backfillRecentLaunches } from "./solana/backfill-launches.js";
 import { PollScheduler } from "./scheduler.js";
 import { OutboxWorker } from "./outbox.js";
 import {
@@ -18,6 +19,8 @@ import {
 } from "./format.js";
 import { eventKey, type TrackerDeps } from "./tracker.js";
 import { log } from "./logger.js";
+
+const BACKFILL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 async function main() {
   const cfg = loadConfig(true);
@@ -110,6 +113,24 @@ async function main() {
   await watcher.start();
   void scheduler.runForever();
   void outbox.runForever();
+
+  // Optional: pick up launches from the last 24h that happened before this
+  // process started. OFF by default (BACKFILL_MAX_TX=0): the DBC program does
+  // ~1000 tx per 30s, so a signature scan only reaches back minutes and costs
+  // thousands of getTransaction calls per restart. Runs in the background so
+  // live detection is never delayed; the scheduler records each launch's
+  // baseline silently before alerting on any change.
+  if (cfg.backfillMaxTx > 0) {
+    void backfillRecentLaunches(db, connection, dbc, {
+      lookbackMs: BACKFILL_LOOKBACK_MS,
+      watchWindowMs: cfg.watchWindowMs,
+      maxLaunchesPerCreator: cfg.maxCreatorLaunches,
+      maxTransactions: cfg.backfillMaxTx,
+    }).catch((err) =>
+      log.warn("backfill-launches failed", err instanceof Error ? err.message : String(err))
+    );
+  }
+
   log.info("tracker running. Ctrl-C to stop.");
 }
 

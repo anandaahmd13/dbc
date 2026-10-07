@@ -46,7 +46,7 @@ export function makeOrderFormatter(creatorOf: (mint: string) => { creator: strin
     const emoji = ORDER_EMOJI[change.status] ?? "💳";
     const title = baseline
       ? "DEX paid profile (first seen)"
-      : "DEX paid profile update";
+      : "DEX paid: Enhanced Token Info";
     const transition = change.previousStatus
       ? `${escapeHtml(change.previousStatus)} → ${escapeHtml(change.status)}`
       : escapeHtml(change.status);
