@@ -1,7 +1,7 @@
 import { Connection } from "@solana/web3.js";
 import { loadConfig } from "../config.js";
 import { Db } from "../db.js";
-import { DbcClient, DBC_PROGRAM_ID, decodeInitializePoolEvents } from "../solana/dbc.js";
+import { DbcClient, DBC_PROGRAM_ID } from "../solana/dbc.js";
 import { fetchOrders, fetchTokenInfo } from "../dexscreener/client.js";
 import { TelegramClient, escapeHtml, clampMessage } from "../telegram.js";
 
@@ -59,12 +59,7 @@ async function main() {
     for (const s of sigs) {
       if (s.err) continue;
       scanned++;
-      const tx = await connection.getTransaction(s.signature, {
-        maxSupportedTransactionVersion: 2,
-        commitment: "confirmed",
-      });
-      const logs = tx?.meta?.logMessages ?? [];
-      const events = decodeInitializePoolEvents(dbc.program as any, logs);
+      const events = await dbc.decodeLaunchesFromTx(s.signature);
       if (events.length > 0) {
         found = { ...events[0]!, signature: s.signature };
         break;

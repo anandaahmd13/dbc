@@ -1,6 +1,11 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import { DbcClient, DBC_PROGRAM_ID, decodeInitializePoolEvents } from "./dbc.js";
+import { DbcClient, DBC_PROGRAM_ID } from "./dbc.js";
 import { log } from "../logger.js";
+
+/** Cheap pre-filter: does this tx's logs show a pool-init instruction? */
+function looksLikeInitPool(logs: string[]): boolean {
+  return logs.some((l) => /Instruction: Initialize\w*Pool|Instruction: InitializeVirtualPool/i.test(l));
+}
 
 export interface DetectedLaunch {
   pool: string;
@@ -135,32 +140,29 @@ export class LaunchWatcher {
     }, delay);
   }
 
-  /** Decode launch events directly from live log messages. */
+  /**
+   * Live path. `onLogs` gives only log strings, but DBC launch events live in
+   * inner instructions — so when the logs show an InitializePool instruction we
+   * fetch the full tx and decode from inner instructions.
+   */
   private async handleLogs(signature: string, logs: string[]): Promise<void> {
     try {
-      const events = decodeInitializePoolEvents(this.dbc.program as any, logs);
-      for (const ev of events) {
-        await this.emit({ ...ev, signature });
+      if (looksLikeInitPool(logs)) {
+        await this.processSignature(signature);
+      } else {
+        this.cursor.setCursor(CURSOR_NAME, signature);
       }
-      this.cursor.setCursor(CURSOR_NAME, signature);
     } catch (err) {
       log.warn(`handleLogs failed for ${signature}`, msg(err));
     }
   }
 
-  /** Backfill path: fetch a tx's logs and decode. */
+  /** Fetch a tx and decode launches from inner instructions (+log fallback). */
   private async processSignature(signature: string): Promise<void> {
     try {
-      const tx = await this.connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 2,
-        commitment: "confirmed",
-      });
-      const logs = tx?.meta?.logMessages ?? [];
-      if (logs.length) {
-        const events = decodeInitializePoolEvents(this.dbc.program as any, logs);
-        for (const ev of events) {
-          await this.emit({ ...ev, signature });
-        }
+      const events = await this.dbc.decodeLaunchesFromTx(signature);
+      for (const ev of events) {
+        await this.emit({ ...ev, signature });
       }
       this.cursor.setCursor(CURSOR_NAME, signature);
     } catch (err) {

@@ -3,6 +3,7 @@ import {
   DynamicBondingCurveClient,
   DYNAMIC_BONDING_CURVE_PROGRAM_ID,
 } from "@meteora-ag/dynamic-bonding-curve-sdk";
+import bs58 from "bs58";
 
 export const DBC_PROGRAM_ID = DYNAMIC_BONDING_CURVE_PROGRAM_ID;
 
@@ -11,6 +12,12 @@ export interface PoolInfo {
   baseMint: string;
   creator: string;
   isMigrated: boolean;
+}
+
+export interface InitPoolEvent {
+  pool: string;
+  baseMint: string;
+  creator: string;
 }
 
 /**
@@ -52,6 +59,41 @@ export class DbcClient {
     const list = await this.client.state.getPoolsByCreator(creator);
     return list.map((pa) => toPoolInfo(pa.publicKey, pa.account));
   }
+
+  /**
+   * Fetch a transaction and decode any initialize-pool events it contains,
+   * checking both inner instructions (DBC emit_cpi! events) and log messages.
+   */
+  async decodeLaunchesFromTx(signature: string): Promise<InitPoolEvent[]> {
+    const tx = await this.connection.getTransaction(signature, {
+      maxSupportedTransactionVersion: 2,
+      commitment: "confirmed",
+    });
+    if (!tx) return [];
+
+    const programId = DBC_PROGRAM_ID.toBase58();
+    const msg: any = tx.transaction.message;
+    const staticKeys: string[] = (msg.staticAccountKeys ?? msg.accountKeys ?? []).map((k: any) =>
+      k.toBase58 ? k.toBase58() : String(k)
+    );
+    const loaded = tx.meta?.loadedAddresses;
+    const accountKeys = [
+      ...staticKeys,
+      ...((loaded?.writable ?? []).map((k: any) => (k.toBase58 ? k.toBase58() : String(k)))),
+      ...((loaded?.readonly ?? []).map((k: any) => (k.toBase58 ? k.toBase58() : String(k)))),
+    ];
+
+    const fromInner = decodeInitializePoolFromInner(
+      this.program as any,
+      (tx.meta?.innerInstructions as any) ?? [],
+      accountKeys,
+      programId
+    );
+    if (fromInner.length) return fromInner;
+
+    // Fallback: legacy Program-data log events.
+    return decodeInitializePoolEvents(this.program as any, tx.meta?.logMessages ?? []);
+  }
 }
 
 function toPoolInfo(poolKey: PublicKey, account: any): PoolInfo {
@@ -66,36 +108,73 @@ function toPoolInfo(poolKey: PublicKey, account: any): PoolInfo {
   };
 }
 
+type EventCoder = {
+  coder: { events: { decode: (b64: string) => { name: string; data: any } | null } };
+};
+
+// Anchor self-CPI (`emit_cpi!`) events are carried as an inner instruction whose
+// data is: 8-byte CPI sentinel + 8-byte event discriminator + borsh payload.
+// The event coder expects base64 of (event disc + payload), so we drop the first
+// 8 bytes. The sentinel in hex:
+const CPI_EVENT_SENTINEL = "e445a52e51cb9a1d";
+
+/** Match the initialize-pool event regardless of casing (evtInitializePool...). */
+function isInitPool(name: string): boolean {
+  return /^evtinitializepool/i.test(name);
+}
+
+function tryEvent(program: EventCoder, b64: string): { name: string; data: any } | null {
+  try {
+    return program.coder.events.decode(b64);
+  } catch {
+    return null;
+  }
+}
+
+function pushIfInit(program: EventCoder, b64: string, out: InitPoolEvent[]): void {
+  const decoded = tryEvent(program, b64);
+  if (!decoded || !isInitPool(decoded.name)) return;
+  const d = decoded.data;
+  if (!d?.pool || !d?.baseMint || !d?.creator) return;
+  out.push({ pool: toB58(d.pool), baseMint: toB58(d.baseMint), creator: toB58(d.creator) });
+}
+
 /**
- * Decode the `creator` + `baseMint` + `pool` out of an EvtInitializePool
- * program event emitted in a transaction's log messages.
- *
- * Anchor events are base64-encoded after the `Program data: ` prefix.
- * Returns every initialize-pool event found in the logs.
+ * Decode initialize-pool events from a transaction's log messages. DBC uses
+ * `emit_cpi!` so most launches carry nothing here, but older `Program data:`
+ * style events are still handled for safety.
  */
-export function decodeInitializePoolEvents(
-  program: { coder: { events: { decode: (b64: string) => { name: string; data: any } | null } } },
-  logs: string[]
-): Array<{ pool: string; baseMint: string; creator: string }> {
-  const out: Array<{ pool: string; baseMint: string; creator: string }> = [];
+export function decodeInitializePoolEvents(program: EventCoder, logs: string[]): InitPoolEvent[] {
+  const out: InitPoolEvent[] = [];
   for (const line of logs) {
     const b64 = extractProgramData(line);
-    if (!b64) continue;
-    let decoded: { name: string; data: any } | null = null;
-    try {
-      decoded = program.coder.events.decode(b64);
-    } catch {
-      decoded = null;
+    if (b64) pushIfInit(program, b64, out);
+  }
+  return out;
+}
+
+/**
+ * Decode initialize-pool events from a transaction's inner instructions (the
+ * real location for DBC `emit_cpi!` events). `innerInstructions` come from
+ * `getTransaction(...).meta.innerInstructions`; each instruction's `data` is
+ * base58-encoded.
+ */
+export function decodeInitializePoolFromInner(
+  program: EventCoder,
+  innerInstructions: Array<{ instructions: Array<{ data: string; programIdIndex: number }> }>,
+  accountKeys: string[],
+  programId: string
+): InitPoolEvent[] {
+  const out: InitPoolEvent[] = [];
+  for (const inner of innerInstructions ?? []) {
+    for (const ix of inner.instructions ?? []) {
+      if (accountKeys[ix.programIdIndex] !== programId) continue;
+      const raw = decodeBase58(ix.data);
+      if (raw.length < 16) continue;
+      if (raw.subarray(0, 8).toString("hex") !== CPI_EVENT_SENTINEL) continue;
+      const b64 = raw.subarray(8).toString("base64");
+      pushIfInit(program, b64, out);
     }
-    if (!decoded) continue;
-    if (!/^EvtInitializePool/.test(decoded.name)) continue;
-    const d = decoded.data;
-    if (!d?.pool || !d?.baseMint || !d?.creator) continue;
-    out.push({
-      pool: toB58(d.pool),
-      baseMint: toB58(d.baseMint),
-      creator: toB58(d.creator),
-    });
   }
   return out;
 }
@@ -103,6 +182,11 @@ export function decodeInitializePoolEvents(
 function extractProgramData(line: string): string | null {
   const m = line.match(/Program data: (.+)/);
   return m ? m[1]!.trim() : null;
+}
+
+function decodeBase58(s: string): Buffer {
+  const dec = (bs58 as any).default ?? bs58;
+  return Buffer.from(dec.decode(s));
 }
 
 function toB58(v: any): string {
