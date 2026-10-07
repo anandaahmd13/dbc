@@ -68,6 +68,7 @@ npm test
 | `MAX_CREATOR_LAUNCHES` | Eligibility cap, inclusive (default 10). |
 | `WATCH_WINDOW_MINUTES` | How long to poll a token after launch (default 1440). |
 | `ORDERS_RPM` / `TOKENS_RPM` | Polling budgets, kept under DEX Screener limits. |
+| `ALERT_ON_LAUNCH` | `true` = also message on every new eligible launch (default `false`). |
 | `DATABASE_PATH` | SQLite file (default `./data/tracker.db`). |
 
 ## References

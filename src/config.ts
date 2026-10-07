@@ -13,6 +13,8 @@ export interface Config {
   tokensRpm: number;
   /** Max txs the startup backfill may inspect; 0 disables it (default). */
   backfillMaxTx: number;
+  /** Send a Telegram message for every new eligible launch (default off). */
+  alertOnLaunch: boolean;
 }
 
 function str(name: string, fallback?: string): string {
@@ -63,6 +65,7 @@ export function loadConfig(requireSecrets = true): Config {
     ordersRpm: num("ORDERS_RPM", 50),
     tokensRpm: num("TOKENS_RPM", 240),
     backfillMaxTx: num("BACKFILL_MAX_TX", 0),
+    alertOnLaunch: bool("ALERT_ON_LAUNCH", false),
   };
 }
 

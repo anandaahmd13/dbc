@@ -81,7 +81,9 @@ async function main() {
       watch_until: Date.now() + cfg.watchWindowMs,
       eligible: true,
     });
-    if (inserted) {
+    // Launch alerts are opt-in: by default the token is tracked silently and the
+    // user only hears about it when it buys a paid profile or changes socials.
+    if (inserted && cfg.alertOnLaunch) {
       db.enqueueEvent({
         eventKey: eventKey(["launch", l.pool]),
         baseMint: l.baseMint,
