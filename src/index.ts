@@ -49,46 +49,54 @@ async function main() {
     formatSocial: makeSocialFormatter(creatorOf),
   };
 
+  const verifyCreator = async (
+    creator: string,
+    currentMint: string
+  ): Promise<"eligible" | "ineligible" | "unknown"> => {
+    const r = await evaluateCreator(db, dbc, creator, cfg.maxCreatorLaunches, { currentMint });
+    log.info(
+      `creator ${creator}: ${r.eligibility} count=${r.launchCount ?? "?"} (mint ${currentMint})`
+    );
+    return r.eligibility;
+  };
+
   const sender: TelegramSender = cfg.dryRun
     ? new DryRunSender()
     : new TelegramClient(cfg.telegramBotToken, cfg.telegramChatId);
 
-  // --- launch handler: eligibility gate + start tracking ---
+  // --- launch handler ---
+  // Record the launch and start monitoring immediately. The creator check (a
+  // heavy RPC scan) runs in its own worker; until it proves the creator has
+  // <= the limit, alerts for this token are HELD, not sent and not lost.
   const onLaunch = async (l: DetectedLaunch) => {
-    const result = await evaluateCreator(db, dbc, l.creator, cfg.maxCreatorLaunches);
-    log.info(
-      `launch ${l.baseMint} by ${l.creator}: eligibility=${result.eligibility} count=${result.launchCount ?? "?"}`
-    );
-    if (result.eligibility !== "eligible") {
-      // Not eligible (or unknown): record the launch but don't track/alert.
-      db.insertLaunch({
-        pool: l.pool,
-        base_mint: l.baseMint,
-        creator: l.creator,
-        signature: l.signature,
-        detected_at: Date.now(),
-        watch_until: 0,
-        eligible: false,
-      });
-      return;
-    }
+    const detectedAt = Date.now();
     const inserted = db.insertLaunch({
       pool: l.pool,
       base_mint: l.baseMint,
       creator: l.creator,
       signature: l.signature,
-      detected_at: Date.now(),
-      watch_until: Date.now() + cfg.watchWindowMs,
-      eligible: true,
+      detected_at: detectedAt,
+      watch_until: detectedAt + cfg.watchWindowMs,
+      eligible: false,
+      pendingCreator: true,
     });
+    if (!inserted) return;
+    log.info(`launch ${l.baseMint} by ${l.creator}: monitoring; creator verification queued`);
+
+    // Try once right away so the common case resolves in seconds.
+    const verdict = await verifyCreator(l.creator, l.baseMint);
+    if (verdict !== "unknown") db.resolveCreator(l.baseMint, verdict === "eligible");
+    else db.rescheduleCreatorCheck(l.baseMint, Date.now() + 10_000);
+
     // Launch alerts are opt-in: by default the token is tracked silently and the
     // user only hears about it when it buys a paid profile or changes socials.
-    if (inserted && cfg.alertOnLaunch) {
+    if (cfg.alertOnLaunch && verdict === "eligible") {
+      const row = db.getCreator(l.creator);
       db.enqueueEvent({
         eventKey: eventKey(["launch", l.pool]),
         baseMint: l.baseMint,
         kind: "launch",
-        text: formatLaunch(l, result.launchCount),
+        text: formatLaunch(l, row?.launch_count ?? null),
       });
     }
   };
@@ -97,17 +105,20 @@ async function main() {
   const scheduler = new PollScheduler(db, deps, {
     ordersRpm: cfg.ordersRpm,
     tokensRpm: cfg.tokensRpm,
-    pollIntervalMs: 60_000,
-  });
+    pollIntervalMs: cfg.pollIntervalMs,
+  }, { verifyCreator });
   const outbox = new OutboxWorker(db, sender);
 
   const shutdown = () => {
     log.info("shutting down…");
     watcher.stop();
-    scheduler.stop();
     outbox.stop();
-    db.close();
-    process.exit(0);
+    // Let in-flight poll work finish (and its transaction commit) before the DB
+    // is closed; bounded so a hung request can't block exit forever.
+    void Promise.race([scheduler.stop(), new Promise((r) => setTimeout(r, 5000))]).finally(() => {
+      db.close();
+      process.exit(0);
+    });
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

@@ -25,6 +25,11 @@ export interface LaunchRow {
   eligible: number;
   baseline_done: number;
   origin: string;
+  next_poll_at: number;
+  poll_attempts: number;
+  pending_creator: number;
+  creator_attempts: number;
+  creator_next_check_at: number;
 }
 
 export interface SnapshotRow {
@@ -33,13 +38,29 @@ export interface SnapshotRow {
   socials_json: string;
   has_info: number;
   updated_at: number;
+  image_url?: string | null;
+  header_url?: string | null;
+  info_fingerprint?: string | null;
+  pending_fingerprint?: string | null;
+}
+
+export interface OrderCheckRow {
+  base_mint: string;
+  reason: string;
+  status: "pending" | "done" | "expired";
+  attempts: number;
+  next_attempt_at: number;
+  deadline_at: number;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface OrderRow {
   base_mint: string;
   order_type: string;
   status: string;
-  payment_ts: number | null;
+  /** 0 when the API gave no paymentTimestamp (stable identity, never NULL). */
+  payment_ts: number;
   updated_at: number;
 }
 
@@ -53,6 +74,8 @@ export interface OutboxRow {
   last_error: string | null;
   created_at: number;
   sent_at: number | null;
+  base_mint: string | null;
+  hold_reason: string | null;
 }
 
 export class Db {
@@ -158,18 +181,33 @@ export class Db {
   }
 
   insertLaunch(
-    row: Omit<LaunchRow, "eligible" | "baseline_done" | "origin"> & {
+    row: Pick<
+      LaunchRow,
+      "pool" | "base_mint" | "creator" | "signature" | "detected_at" | "watch_until"
+    > & {
       eligible: boolean;
       origin?: "live" | "backfill";
+      /** Creator not yet proven: monitor now, hold alerts until verified. */
+      pendingCreator?: boolean;
     }
   ): boolean {
     const res = this.raw
       .prepare(
         `INSERT OR IGNORE INTO launches
-         (pool, base_mint, creator, signature, detected_at, watch_until, eligible, origin)
-         VALUES (@pool, @base_mint, @creator, @signature, @detected_at, @watch_until, @eligible, @origin)`
+         (pool, base_mint, creator, signature, detected_at, watch_until, eligible, origin, pending_creator)
+         VALUES (@pool, @base_mint, @creator, @signature, @detected_at, @watch_until, @eligible, @origin, @pending_creator)`
       )
-      .run({ ...row, eligible: row.eligible ? 1 : 0, origin: row.origin ?? "live" });
+      .run({
+        pool: row.pool,
+        base_mint: row.base_mint,
+        creator: row.creator,
+        signature: row.signature,
+        detected_at: row.detected_at,
+        watch_until: row.watch_until,
+        eligible: row.eligible ? 1 : 0,
+        origin: row.origin ?? "live",
+        pending_creator: row.pendingCreator ? 1 : 0,
+      });
     return res.changes > 0;
   }
 
@@ -196,15 +234,28 @@ export class Db {
   upsertSnapshot(row: SnapshotRow): void {
     this.raw
       .prepare(
-        `INSERT INTO token_snapshots (base_mint, websites_json, socials_json, has_info, updated_at)
-         VALUES (@base_mint, @websites_json, @socials_json, @has_info, @updated_at)
+        `INSERT INTO token_snapshots
+           (base_mint, websites_json, socials_json, has_info, updated_at,
+            image_url, header_url, info_fingerprint, pending_fingerprint)
+         VALUES (@base_mint, @websites_json, @socials_json, @has_info, @updated_at,
+                 @image_url, @header_url, @info_fingerprint, @pending_fingerprint)
          ON CONFLICT(base_mint) DO UPDATE SET
            websites_json = excluded.websites_json,
            socials_json = excluded.socials_json,
            has_info = excluded.has_info,
-           updated_at = excluded.updated_at`
+           updated_at = excluded.updated_at,
+           image_url = excluded.image_url,
+           header_url = excluded.header_url,
+           info_fingerprint = excluded.info_fingerprint,
+           pending_fingerprint = excluded.pending_fingerprint`
       )
-      .run(row);
+      .run({
+        image_url: null,
+        header_url: null,
+        info_fingerprint: null,
+        pending_fingerprint: null,
+        ...row,
+      });
   }
 
   // --- orders ---
@@ -221,7 +272,7 @@ export class Db {
            status = excluded.status,
            updated_at = excluded.updated_at`
       )
-      .run(row);
+      .run({ ...row, payment_ts: row.payment_ts ?? 0 });
   }
 
   // --- events + outbox (atomic) ---
@@ -244,15 +295,100 @@ export class Db {
         )
         .run(params.eventKey, params.baseMint, params.kind, now);
       if (ins.changes === 0) return false;
+      // Fail closed: if the launch's creator is not proven <= the limit, park the
+      // message instead of sending it. Verification later releases or drops it.
+      const pending = this.raw
+        .prepare("SELECT pending_creator FROM launches WHERE base_mint = ?")
+        .get(params.baseMint) as { pending_creator: number } | undefined;
+      const hold = pending?.pending_creator === 1;
       this.raw
         .prepare(
-          `INSERT OR IGNORE INTO outbox (event_key, text, created_at, next_attempt_at)
-           VALUES (?, ?, ?, 0)`
+          `INSERT OR IGNORE INTO outbox
+             (event_key, text, created_at, next_attempt_at, status, base_mint, hold_reason)
+           VALUES (?, ?, ?, 0, ?, ?, ?)`
         )
-        .run(params.eventKey, params.text, now);
+        .run(
+          params.eventKey,
+          params.text,
+          now,
+          hold ? "held" : "pending",
+          params.baseMint,
+          hold ? "creator_unverified" : null
+        );
       return true;
     });
     return tx();
+  }
+
+  /**
+   * A creator verdict arrived for this launch. Eligible: monitoring stays on and
+   * held alerts are released. Ineligible: stop monitoring and discard held alerts.
+   * Returns how many held messages were released/dropped.
+   */
+  resolveCreator(mint: string, eligible: boolean): { released: number; dropped: number } {
+    const tx = this.raw.transaction(() => {
+      this.raw
+        .prepare(
+          `UPDATE launches SET pending_creator = 0, eligible = ?, creator_attempts = 0
+           WHERE base_mint = ?`
+        )
+        .run(eligible ? 1 : 0, mint);
+      if (eligible) {
+        const r = this.raw
+          .prepare(
+            `UPDATE outbox SET status = 'pending', hold_reason = NULL
+             WHERE base_mint = ? AND status = 'held'`
+          )
+          .run(mint);
+        return { released: r.changes, dropped: 0 };
+      }
+      const r = this.raw
+        .prepare(
+          `UPDATE outbox SET status = 'dropped', hold_reason = 'creator_ineligible'
+           WHERE base_mint = ? AND status = 'held'`
+        )
+        .run(mint);
+      return { released: 0, dropped: r.changes };
+    });
+    return tx();
+  }
+
+  // --- creator verification queue ---
+
+  /** Launches monitored but still waiting for a proven creator verdict. */
+  launchesAwaitingCreator(now: number, limit: number): LaunchRow[] {
+    return this.raw
+      .prepare(
+        `SELECT * FROM launches
+         WHERE pending_creator = 1 AND watch_until > @now AND creator_next_check_at <= @now
+         ORDER BY creator_next_check_at ASC, detected_at ASC LIMIT @limit`
+      )
+      .all({ now, limit }) as LaunchRow[];
+  }
+
+  rescheduleCreatorCheck(mint: string, nextAt: number): void {
+    this.raw
+      .prepare(
+        `UPDATE launches SET creator_attempts = creator_attempts + 1, creator_next_check_at = ?
+         WHERE base_mint = ?`
+      )
+      .run(nextAt, mint);
+  }
+
+  /** Distinct mints this creator launched, as recorded from creation events. */
+  mintsLaunchedBy(creator: string): string[] {
+    return (
+      this.raw.prepare("SELECT DISTINCT base_mint FROM launches WHERE creator = ?").all(creator) as {
+        base_mint: string;
+      }[]
+    ).map((r) => r.base_mint);
+  }
+
+  /** Other launches by the same creator that are waiting on its verdict. */
+  launchesByCreatorPending(creator: string): LaunchRow[] {
+    return this.raw
+      .prepare("SELECT * FROM launches WHERE creator = ? AND pending_creator = 1")
+      .all(creator) as LaunchRow[];
   }
 
   claimPendingOutbox(now: number, limit = 10): OutboxRow[] {
@@ -285,6 +421,104 @@ export class Db {
         `UPDATE outbox SET status = 'failed', attempts = attempts + 1, last_error = ? WHERE id = ?`
       )
       .run(error.slice(0, 500), id);
+  }
+
+  // --- scheduling (per-launch, survives restart) ---
+
+  /**
+   * Launches whose DEX Screener data is due, oldest-due first. Includes launches
+   * still waiting on creator verification (monitoring continues; alerts are held).
+   */
+  dueLaunches(now: number, limit: number): LaunchRow[] {
+    return this.raw
+      .prepare(
+        `SELECT * FROM launches
+         WHERE (eligible = 1 OR pending_creator = 1)
+           AND watch_until > @now
+           AND next_poll_at <= @now
+         ORDER BY baseline_done ASC, next_poll_at ASC, detected_at ASC
+         LIMIT @limit`
+      )
+      .all({ now, limit }) as LaunchRow[];
+  }
+
+  /** Count of launches still being monitored (for diagnostics). */
+  countMonitored(now: number): number {
+    const r = this.raw
+      .prepare(
+        `SELECT COUNT(*) c FROM launches
+         WHERE (eligible = 1 OR pending_creator = 1) AND watch_until > ?`
+      )
+      .get(now) as { c: number };
+    return r.c;
+  }
+
+  /** Record the outcome of a poll for a set of mints. */
+  reschedulePolls(mints: string[], nextPollAt: number, ok: boolean): void {
+    const upd = this.raw.prepare(
+      `UPDATE launches SET next_poll_at = ?, poll_attempts = CASE WHEN ? THEN 0 ELSE poll_attempts + 1 END
+       WHERE base_mint = ?`
+    );
+    const tx = this.raw.transaction(() => {
+      for (const m of mints) upd.run(nextPollAt, ok ? 1 : 0, m);
+    });
+    tx();
+  }
+
+  // --- order-check jobs (durable) ---
+
+  /**
+   * Ask for one order check for this mint. A pending job is left alone (its
+   * deadline is NOT extended, so retries stay bounded); a finished or expired job
+   * is reopened with a fresh deadline.
+   */
+  enqueueOrderCheck(mint: string, reason: string, now: number, windowMs: number): void {
+    this.raw
+      .prepare(
+        `INSERT INTO order_checks
+           (base_mint, reason, status, attempts, next_attempt_at, deadline_at, created_at, updated_at)
+         VALUES (@mint, @reason, 'pending', 0, @now, @deadline, @now, @now)
+         ON CONFLICT(base_mint) DO UPDATE SET
+           reason = excluded.reason,
+           status = 'pending',
+           attempts = 0,
+           next_attempt_at = excluded.next_attempt_at,
+           deadline_at = excluded.deadline_at,
+           updated_at = excluded.updated_at
+         WHERE order_checks.status != 'pending'`
+      )
+      .run({ mint, reason, now, deadline: now + windowMs });
+  }
+
+  dueOrderChecks(now: number, limit: number): OrderCheckRow[] {
+    return this.raw
+      .prepare(
+        `SELECT * FROM order_checks
+         WHERE status = 'pending' AND next_attempt_at <= ?
+         ORDER BY next_attempt_at ASC LIMIT ?`
+      )
+      .all(now, limit) as OrderCheckRow[];
+  }
+
+  getOrderCheck(mint: string): OrderCheckRow | undefined {
+    return this.raw.prepare("SELECT * FROM order_checks WHERE base_mint = ?").get(mint) as
+      | OrderCheckRow
+      | undefined;
+  }
+
+  retryOrderCheck(mint: string, nextAttemptAt: number): void {
+    this.raw
+      .prepare(
+        `UPDATE order_checks SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
+         WHERE base_mint = ? AND status = 'pending'`
+      )
+      .run(nextAttemptAt, Date.now(), mint);
+  }
+
+  finishOrderCheck(mint: string, status: "done" | "expired"): void {
+    this.raw
+      .prepare("UPDATE order_checks SET status = ?, updated_at = ? WHERE base_mint = ?")
+      .run(status, Date.now(), mint);
   }
 
   close() {

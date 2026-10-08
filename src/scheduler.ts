@@ -1,172 +1,265 @@
 import type { Db, LaunchRow } from "./db.js";
 import type { TrackerDeps } from "./tracker.js";
-import { pollOrders, pollSocials, seedBaseline } from "./tracker.js";
-import { DexScreenerError } from "./dexscreener/client.js";
+import { applySocialBatch, runOrderCheck } from "./tracker.js";
+import { DexScreenerError, fetchTokenInfo } from "./dexscreener/client.js";
+import type { TokenInfo } from "./dexscreener/client.js";
 import { log } from "./logger.js";
 
 /**
- * Simple token-bucket rate limiter. `acquire()` resolves once a request slot is
- * available, keeping throughput under `rpm` requests per minute.
+ * Token-bucket limiter. `acquire()` resolves once a request slot is available,
+ * keeping throughput under `rpm`. It starts with a small burst (not a full
+ * minute's worth) so a restart cannot spend the whole budget instantly, and it
+ * can be paused as a whole (`blockFor`) when the server says 429.
  */
 export class RateLimiter {
   private tokens: number;
   private last: number;
+  private blockedUntil = 0;
 
-  constructor(private readonly rpm: number, private readonly now: () => number = Date.now) {
-    this.tokens = rpm;
+  constructor(
+    private readonly rpm: number,
+    private readonly now: () => number = Date.now,
+    private readonly burst: number = Math.max(1, Math.ceil(rpm / 12)),
+    /** Injectable so tests driving a fake clock can advance it instead of waiting. */
+    private readonly wait: (ms: number, signal?: AbortSignal) => Promise<void> = sleep
+  ) {
+    this.tokens = Math.min(burst, rpm);
     this.last = now();
   }
 
   private refill() {
     const t = this.now();
     const elapsed = (t - this.last) / 60_000;
-    this.tokens = Math.min(this.rpm, this.tokens + elapsed * this.rpm);
+    this.tokens = Math.min(Math.min(this.burst, this.rpm), this.tokens + elapsed * this.rpm);
     this.last = t;
+  }
+
+  /** Pause every consumer of this limiter for `ms` (e.g. after a 429). */
+  blockFor(ms: number): void {
+    this.blockedUntil = Math.max(this.blockedUntil, this.now() + ms);
   }
 
   /** ms to wait until a token is available (0 if ready now). */
   msUntilToken(): number {
     this.refill();
-    if (this.tokens >= 1) return 0;
+    const blocked = Math.max(0, this.blockedUntil - this.now());
+    if (this.tokens >= 1) return blocked;
     const need = 1 - this.tokens;
-    return Math.ceil((need / this.rpm) * 60_000);
+    return Math.max(blocked, Math.ceil((need / this.rpm) * 60_000));
   }
 
-  async acquire(): Promise<void> {
+  async acquire(signal?: AbortSignal): Promise<void> {
     for (;;) {
+      if (signal?.aborted) throw new Error("aborted");
       const wait = this.msUntilToken();
       if (wait === 0) {
         this.tokens -= 1;
         return;
       }
-      await sleep(wait + jitter(50));
+      await this.wait(wait + jitter(50), signal);
     }
   }
 }
-
-const MAX_BASELINES_PER_PASS = 5;
 
 export interface SchedulerConfig {
   ordersRpm: number;
   tokensRpm: number;
-  /** base poll interval per token (ms) */
+  /** how often each monitored token's socials are refreshed (ms) */
   pollIntervalMs: number;
 }
 
+const BATCH = 30;
+/** Retry delay when a launch has no DEX Screener pair data yet. */
+const NO_DATA_RETRY_MS = 15_000;
+
+/** Verifies one creator; supplied by index.ts so the scheduler stays RPC-agnostic. */
+export type CreatorVerifier = (
+  creator: string,
+  currentMint: string
+) => Promise<"eligible" | "ineligible" | "unknown">;
+
+export interface SchedulerHooks {
+  /** Creator verification for launches whose creator is not yet proven. */
+  verifyCreator?: CreatorVerifier;
+  /** Injectable for tests; defaults to the real fetchers/clock. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  fetchInfo?: (mints: string[]) => Promise<Map<string, TokenInfo>>;
+  fetchOrders?: (mint: string) => Promise<import("./dexscreener/client.js").OrderEntry[]>;
+  now?: () => number;
+}
+
 /**
- * Drives DEX Screener polling for all active (eligible, in-window) launches,
- * respecting rate budgets. Social info is batched (30/call); orders are 1/call.
+ * Three independent workers over shared, fair rate limits:
+ *
+ *  - socials:  batches of 30 due launches -> baseline (silent) or change-diff.
+ *              Uses ONLY the tokens limiter, so a backlog of orders can never
+ *              delay it.
+ *  - orders:   drains the durable `order_checks` queue (jobs are created only
+ *              when a profile appears/changes). Uses ONLY the orders limiter.
+ *
+ * Neither waits on the other's cycle, and each re-reads the clock every
+ * iteration, so a slow pass can't make the next one act on stale time.
  */
 export class PollScheduler {
-  private ordersRl: RateLimiter;
-  private tokensRl: RateLimiter;
-  private stopped = false;
-  private readonly nextOrderPoll = new Map<string, number>();
-  private readonly nextBaselineTry = new Map<string, number>();
-  private lastSocialCycle = 0;
+  readonly ordersRl: RateLimiter;
+  readonly tokensRl: RateLimiter;
+  private readonly abort = new AbortController();
+  private running: Promise<void>[] = [];
+  private readonly now: () => number;
 
   constructor(
     private readonly db: Db,
     private readonly deps: TrackerDeps,
-    private readonly cfg: SchedulerConfig
+    private readonly cfg: SchedulerConfig,
+    private readonly hooks: SchedulerHooks = {}
   ) {
-    this.ordersRl = new RateLimiter(cfg.ordersRpm);
-    this.tokensRl = new RateLimiter(cfg.tokensRpm);
+    this.now = hooks.now ?? Date.now;
+    const wait = hooks.sleep ?? sleep;
+    this.ordersRl = new RateLimiter(cfg.ordersRpm, this.now, undefined, wait);
+    this.tokensRl = new RateLimiter(cfg.tokensRpm, this.now, undefined, wait);
   }
 
-  stop() {
-    this.stopped = true;
+  /** Start both workers. Resolves only after they have been stopped. */
+  start(): Promise<void> {
+    this.running = [
+      this.loop("socials", () => this.socialStep()),
+      this.loop("orders", () => this.orderStep()),
+      this.loop("creators", () => this.creatorStep()),
+    ];
+    return Promise.all(this.running).then(() => undefined);
   }
 
-  async runForever(): Promise<void> {
-    while (!this.stopped) {
-      const now = Date.now();
-      const active = this.db.activeLaunches(now);
-      if (active.length === 0) {
-        await sleep(2000);
-        continue;
+  /** Kept for the existing entry point. */
+  runForever(): Promise<void> {
+    return this.start();
+  }
+
+  /** Stop both workers and wait for in-flight work to finish. */
+  async stop(): Promise<void> {
+    this.abort.abort();
+    await Promise.allSettled(this.running);
+  }
+
+  private async loop(name: string, step: () => Promise<number>): Promise<void> {
+    while (!this.abort.signal.aborted) {
+      let worked = 0;
+      try {
+        worked = await step();
+      } catch (err) {
+        if (this.abort.signal.aborted) return;
+        log.warn(`${name} worker error`, err instanceof Error ? err.message : String(err));
+        await sleep(2000, this.abort.signal).catch(() => {});
       }
-      await this.cycleBaselines(active);
-      const current = this.db.activeLaunches(Date.now());
-      // Socials alert only on changes, so they wait for the silent baseline.
-      await this.cycleSocials(current.filter((l) => l.baseline_done === 1), now);
-      // Orders need no baseline for live launches: such a token cannot have paid
-      // before we watched it, so any tokenProfile order we read is new. Backfilled
-      // launches still wait, since they may have paid before we started.
-      await this.cycleOrders(
-        current.filter((l) => l.origin === "live" || l.baseline_done === 1),
-        now
-      );
-      await sleep(1000);
+      if (worked === 0) await sleep(1000, this.abort.signal).catch(() => {});
     }
   }
 
   /**
-   * Record the silent baseline (orders + socials, no alerts) for launches that
-   * lack one. A launch whose pair isn't indexed by DEX Screener yet stays
-   * un-baselined and is retried after a delay.
+   * One social step: take up to 30 due launches (un-baselined first), fetch them
+   * in a single request, apply atomically, reschedule. Returns launches handled.
    */
-  private async cycleBaselines(active: LaunchRow[]): Promise<void> {
-    // Cap per loop pass so a big backfill can't starve change-polling of tokens
-    // that are already baselined; remaining launches are picked up next pass.
-    let budget = MAX_BASELINES_PER_PASS;
-    for (const l of active) {
-      if (this.stopped || budget <= 0) return;
-      if (l.baseline_done === 1) continue;
-      if ((this.nextBaselineTry.get(l.base_mint) ?? 0) > Date.now()) continue;
-      budget--;
-      await this.ordersRl.acquire();
-      await this.tokensRl.acquire();
-      try {
-        const done = await seedBaseline(this.deps, l.base_mint, { origin: l.origin });
-        if (!done) {
-          log.debug(`baseline pending (no DEX Screener data yet): ${l.base_mint}`);
-          this.nextBaselineTry.set(l.base_mint, Date.now() + this.cfg.pollIntervalMs);
-        }
-      } catch (err) {
-        const backoff = this.handleDexErr("baseline", err);
-        this.nextBaselineTry.set(l.base_mint, Date.now() + backoff);
-      }
+  async socialStep(): Promise<number> {
+    const now = this.now();
+    const due = this.db.dueLaunches(now, BATCH);
+    if (due.length === 0) return 0;
+    const mints = due.map((l) => l.base_mint);
+
+    await this.tokensRl.acquire(this.abort.signal);
+    let infos: Map<string, TokenInfo>;
+    try {
+      infos = await (this.hooks.fetchInfo ?? fetchTokenInfo)(mints);
+    } catch (err) {
+      const wait = this.backoff("socials", err, this.tokensRl);
+      this.db.reschedulePolls(mints, this.now() + wait, false);
+      return due.length;
     }
+
+    const res = applySocialBatch(this.deps, mints, infos, this.now());
+    const seen = new Set(res.seen);
+    const next = this.now();
+    this.db.reschedulePolls(
+      mints.filter((m) => seen.has(m)),
+      next + this.cfg.pollIntervalMs,
+      true
+    );
+    // Not indexed yet (or thin response): try again soon, never read as removal.
+    this.db.reschedulePolls(
+      mints.filter((m) => !seen.has(m)),
+      next + NO_DATA_RETRY_MS,
+      false
+    );
+    if (res.baselined.length || res.orderChecksQueued.length || res.alerted.length) {
+      log.debug(
+        `socials batch=${mints.length} seen=${seen.size} baselined=${res.baselined.length} ` +
+          `orderChecks=${res.orderChecksQueued.length} alerts=${res.alerted.length}`
+      );
+    }
+    return due.length;
   }
 
-  /** Poll socials for all active mints in batches of 30, once per interval. */
-  private async cycleSocials(active: LaunchRow[], now: number): Promise<void> {
-    if (now - this.lastSocialCycle < this.cfg.pollIntervalMs) return;
-    this.lastSocialCycle = now;
-    const mints = active.map((l) => l.base_mint);
-    for (let i = 0; i < mints.length; i += 30) {
-      const batch = mints.slice(i, i + 30);
-      await this.tokensRl.acquire();
+  /** One order step: run due jobs from the durable queue. Returns jobs run. */
+  async orderStep(): Promise<number> {
+    const now = this.now();
+    const jobs = this.db.dueOrderChecks(now, 5);
+    for (const job of jobs) {
+      if (this.abort.signal.aborted) return jobs.length;
+      await this.ordersRl.acquire(this.abort.signal);
       try {
-        await pollSocials(this.deps, batch);
+        await runOrderCheck(this.deps, job.base_mint, {
+          fetchOrders: this.hooks.fetchOrders,
+          now: this.now(),
+        });
       } catch (err) {
-        this.handleDexErr("socials", err);
+        const wait = this.backoff("orders", err, this.ordersRl);
+        // Keep the job pending; the deadline still bounds total retries.
+        const fresh = this.db.getOrderCheck(job.base_mint);
+        if (fresh && this.now() >= fresh.deadline_at) this.db.finishOrderCheck(job.base_mint, "expired");
+        else this.db.retryOrderCheck(job.base_mint, this.now() + wait);
       }
     }
+    return jobs.length;
   }
 
-  /** Poll orders one mint at a time, each on its own schedule. */
-  private async cycleOrders(active: LaunchRow[], now: number): Promise<void> {
-    for (const l of active) {
-      if (this.stopped) return;
-      const due = this.nextOrderPoll.get(l.base_mint) ?? 0;
-      if (due > now) continue;
-      await this.ordersRl.acquire();
+  /**
+   * One creator step: verify up to a few launches whose creator is unproven, one
+   * RPC scan at a time. Unknown stays monitored and retries with growing backoff
+   * until the watch window ends; a verdict releases or drops its held alerts.
+   */
+  async creatorStep(): Promise<number> {
+    const verify = this.hooks.verifyCreator;
+    if (!verify) return 0;
+    const jobs = this.db.launchesAwaitingCreator(this.now(), 3);
+    for (const job of jobs) {
+      if (this.abort.signal.aborted) return jobs.length;
+      let verdict: "eligible" | "ineligible" | "unknown" = "unknown";
       try {
-        await pollOrders(this.deps, l.base_mint);
-        this.nextOrderPoll.set(l.base_mint, Date.now() + this.cfg.pollIntervalMs);
+        verdict = await verify(job.creator, job.base_mint);
       } catch (err) {
-        const backoff = this.handleDexErr("orders", err);
-        this.nextOrderPoll.set(l.base_mint, Date.now() + backoff);
+        log.warn(`creator verification error for ${job.creator}`, err instanceof Error ? err.message : String(err));
+      }
+      if (verdict === "unknown") {
+        // 10s, 20s, 40s ... capped at 5 min, with jitter.
+        const delay = Math.min(10_000 * 2 ** job.creator_attempts, 300_000);
+        this.db.rescheduleCreatorCheck(job.base_mint, this.now() + delay + jitter(2000));
+        continue;
+      }
+      // The verdict is per creator: resolve every launch of theirs that was waiting.
+      for (const l of this.db.launchesByCreatorPending(job.creator)) {
+        const r = this.db.resolveCreator(l.base_mint, verdict === "eligible");
+        log.info(
+          `creator ${job.creator} ${verdict}: ${l.base_mint} released=${r.released} dropped=${r.dropped}`
+        );
       }
     }
+    return jobs.length;
   }
 
-  private handleDexErr(label: string, err: unknown): number {
+  /** Log + return a backoff; on 429/5xx pause the whole limiter for everyone. */
+  private backoff(label: string, err: unknown, limiter: RateLimiter): number {
     if (err instanceof DexScreenerError) {
-      const wait = err.retryAfterMs ?? 5000;
-      log.warn(`DEX Screener ${label} ${err.status}; backing off ${wait}ms`);
+      const wait = err.retryAfterMs ?? 5000 + jitter(2000);
+      log.warn(`DEX Screener ${label} ${err.status}; pausing ${label} for ${wait}ms`);
+      limiter.blockFor(wait);
       return wait;
     }
     log.warn(`DEX Screener ${label} error`, err instanceof Error ? err.message : String(err));
@@ -174,8 +267,21 @@ export class PollScheduler {
   }
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+export type { LaunchRow };
+
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("aborted"));
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function jitter(maxMs: number): number {

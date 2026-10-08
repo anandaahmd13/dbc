@@ -88,9 +88,13 @@ export async function backfillRecentLaunches(
         found++;
 
         const launchedAt = (s.blockTime ?? Math.floor(Date.now() / 1000)) * 1000;
-        const result = await evaluateCreator(db, dbc, ev.creator, opts.maxLaunchesPerCreator);
-        const eligible = result.eligibility === "eligible";
-        const watchUntil = eligible ? launchedAt + opts.watchWindowMs : 0;
+        const result = await evaluateCreator(db, dbc, ev.creator, opts.maxLaunchesPerCreator, {
+          currentMint: ev.baseMint,
+        });
+        // ineligible: not worth tracking. eligible: track. unknown: track too, with
+        // alerts held until the creator worker proves it (same as a live launch).
+        const track = result.eligibility !== "ineligible";
+        const watchUntil = track ? launchedAt + opts.watchWindowMs : 0;
 
         const inserted = db.insertLaunch({
           pool: ev.pool,
@@ -99,10 +103,11 @@ export async function backfillRecentLaunches(
           signature: s.signature,
           detected_at: launchedAt,
           watch_until: watchUntil,
-          eligible,
+          eligible: result.eligibility === "eligible",
+          pendingCreator: result.eligibility === "unknown",
           origin: "backfill",
         });
-        if (inserted && eligible) tracked++;
+        if (inserted && track) tracked++;
       }
     }
 

@@ -1,6 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import {
   DynamicBondingCurveClient,
+  DynamicBondingCurveIdl,
   DYNAMIC_BONDING_CURVE_PROGRAM_ID,
 } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import bs58 from "bs58";
@@ -13,6 +14,24 @@ export interface PoolInfo {
   creator: string;
   isMigrated: boolean;
 }
+
+/** Pools a creator account currently holds, plus whether the scan is provably complete. */
+export interface CreatorPools {
+  pools: Array<{ baseMint: string; pool?: string }>;
+  /** false when any page failed, a cursor repeated, or the page cap was hit. */
+  complete: boolean;
+}
+
+/** Minimal JSON-RPC transport; injectable so pagination can be tested offline. */
+export type RpcCall = (method: string, params: unknown[]) => Promise<any>;
+
+// Field layout verified from the SDK IDL and on mainnet: in both VirtualPool and
+// TransferHookPool the PoolState starts right after the 8-byte discriminator, and
+// `creator` (32 bytes) is followed 32 bytes later by `base_mint`.
+const CREATOR_OFFSET = 104;
+const SLICE_LENGTH = 64;
+const PAGE_LIMIT = 1000;
+const MAX_PAGES = 20;
 
 export interface InitPoolEvent {
   pool: string;
@@ -27,8 +46,11 @@ export interface InitPoolEvent {
 export class DbcClient {
   readonly client: DynamicBondingCurveClient;
 
-  constructor(public readonly connection: Connection) {
+  private readonly rpc: RpcCall;
+
+  constructor(public readonly connection: Connection, rpc?: RpcCall) {
     this.client = new DynamicBondingCurveClient(connection, "confirmed");
+    this.rpc = rpc ?? ((method, params) => httpRpc(connection.rpcEndpoint, method, params));
   }
 
   /** The DBC Anchor program, used for event/account decoding. */
@@ -58,6 +80,71 @@ export class DbcClient {
   async getPoolsByCreator(creator: string | PublicKey): Promise<PoolInfo[]> {
     const list = await this.client.state.getPoolsByCreator(creator);
     return list.map((pa) => toPoolInfo(pa.publicKey, pa.account));
+  }
+
+  /**
+   * Pools currently held by `creator`, via Helius `getProgramAccountsV2` with
+   * cursor pagination (the plain `getProgramAccounts` is rejected for a program
+   * this large). Falls back to the SDK scan when V2 is unavailable.
+   *
+   * This is a snapshot of CURRENT holdings. A pool transferred away is no longer
+   * listed, so a clean result is not proof of every launch the wallet ever made:
+   * callers combine it with launches recorded from creation events.
+   */
+  async getCreatorPools(creator: string): Promise<CreatorPools> {
+    const found = new Map<string, { baseMint: string; pool?: string }>();
+    let complete = true;
+    try {
+      for (const account of ["VirtualPool", "TransferHookPool"]) {
+        const disc = accountDiscriminator(account);
+        const part = await this.pagedCreatorScan(creator, disc);
+        for (const p of part.pools) found.set(p.baseMint, p);
+        complete &&= part.complete;
+      }
+      return { pools: [...found.values()], complete };
+    } catch (err) {
+      if (!isMethodUnavailable(err)) throw err;
+      // V2 is a Helius extension; on other RPCs use the SDK (may be rejected for
+      // size, in which case this throws and the caller records "unknown").
+      const list = await this.getPoolsByCreator(creator);
+      return { pools: list.map((p) => ({ baseMint: p.baseMint, pool: p.pool })), complete: true };
+    }
+  }
+
+  private async pagedCreatorScan(creator: string, disc: number[]): Promise<CreatorPools> {
+    const out: Array<{ baseMint: string; pool?: string }> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const opts: Record<string, unknown> = {
+        encoding: "base64",
+        limit: PAGE_LIMIT,
+        filters: [
+          { memcmp: { offset: 0, bytes: bs58.encode(Uint8Array.from(disc)) } },
+          { memcmp: { offset: CREATOR_OFFSET, bytes: creator } },
+        ],
+        dataSlice: { offset: CREATOR_OFFSET, length: SLICE_LENGTH },
+      };
+      if (cursor) opts.paginationKey = cursor;
+      const res = await this.rpc("getProgramAccountsV2", [DBC_PROGRAM_ID.toBase58(), opts]);
+      const result = res?.result ?? res;
+      const accounts: any[] = result?.accounts ?? [];
+      for (const a of accounts) {
+        const raw = Buffer.from(a.account.data[0], "base64");
+        if (raw.length < SLICE_LENGTH) continue;
+        out.push({
+          baseMint: new PublicKey(raw.subarray(32, 64)).toBase58(),
+          pool: a.pubkey,
+        });
+      }
+      const next: string | null = result?.paginationKey ?? null;
+      // A filtered page may be short; only a null key ends the scan.
+      if (!next) return { pools: out, complete: true };
+      if (seenCursors.has(next)) return { pools: out, complete: false }; // stuck cursor
+      seenCursors.add(next);
+      cursor = next;
+    }
+    return { pools: out, complete: false }; // page cap: refuse to claim completeness
   }
 
   /**
@@ -191,4 +278,32 @@ function decodeBase58(s: string): Buffer {
 
 function toB58(v: any): string {
   return v?.toBase58 ? v.toBase58() : String(v);
+}
+
+/** True for "this RPC doesn't have getProgramAccountsV2" (not a transient failure). */
+function isMethodUnavailable(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  return /method not found|-32601|not supported|unknown method/i.test(m);
+}
+
+async function httpRpc(endpoint: string, method: string, params: unknown[]): Promise<any> {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "1", method, params }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const body: any = await res.json().catch(() => ({}));
+  if (!res.ok || body?.error) {
+    const e = body?.error;
+    throw new Error(`RPC ${method} failed: ${e ? `${e.code} ${e.message}` : `HTTP ${res.status}`}`);
+  }
+  return body;
+}
+
+/** Anchor account discriminator from the SDK's bundled IDL (e.g. "VirtualPool"). */
+export function accountDiscriminator(name: string): number[] {
+  const acc = (DynamicBondingCurveIdl as any).accounts.find((a: any) => a.name === name);
+  if (!acc?.discriminator) throw new Error(`DBC IDL has no account named ${name}`);
+  return acc.discriminator as number[];
 }

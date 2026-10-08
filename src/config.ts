@@ -15,6 +15,8 @@ export interface Config {
   backfillMaxTx: number;
   /** Send a Telegram message for every new eligible launch (default off). */
   alertOnLaunch: boolean;
+  /** How often each monitored token's DEX Screener profile is refreshed (ms). */
+  pollIntervalMs: number;
 }
 
 function str(name: string, fallback?: string): string {
@@ -66,6 +68,7 @@ export function loadConfig(requireSecrets = true): Config {
     tokensRpm: num("TOKENS_RPM", 240),
     backfillMaxTx: num("BACKFILL_MAX_TX", 0),
     alertOnLaunch: bool("ALERT_ON_LAUNCH", false),
+    pollIntervalMs: num("POLL_INTERVAL_SECONDS", 60) * 1000,
   };
 }
 

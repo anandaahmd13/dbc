@@ -20,6 +20,35 @@ export interface TokenInfo {
   hasInfo: boolean;
   websites: string[];
   socials: TokenSocial[];
+  /** Profile icon / banner, normalized (no size or cache-buster params). */
+  imageUrl: string | null;
+  headerUrl: string | null;
+}
+
+/**
+ * Strip query string and fragment from a DEX Screener CDN image URL. The same
+ * image is served with `?width=800&quality=95...` variants and cache-busting
+ * timestamps; only the path identifies the image.
+ */
+export function normalizeImageUrl(u: unknown): string | null {
+  if (typeof u !== "string" || u === "") return null;
+  try {
+    const url = new URL(u);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return u.split(/[?#]/)[0] || null;
+  }
+}
+
+export function emptyTokenInfo(): TokenInfo {
+  return {
+    present: false,
+    hasInfo: false,
+    websites: [],
+    socials: [],
+    imageUrl: null,
+    headerUrl: null,
+  };
 }
 
 export class DexScreenerError extends Error {
@@ -91,7 +120,7 @@ export async function fetchTokenInfo(
   chain = "solana"
 ): Promise<Map<string, TokenInfo>> {
   const out = new Map<string, TokenInfo>();
-  for (const m of mints) out.set(m, { present: false, hasInfo: false, websites: [], socials: [] });
+  for (const m of mints) out.set(m, emptyTokenInfo());
   if (mints.length === 0) return out;
   if (mints.length > 30) throw new Error("fetchTokenInfo: max 30 mints per call");
 
@@ -109,6 +138,10 @@ export async function fetchTokenInfo(
     cur.present = true;
     if (info) {
       cur.hasInfo = true;
+      // Several pairs can carry the profile; keep the first non-empty value so
+      // pair ordering never flips the result.
+      cur.imageUrl ??= normalizeImageUrl(info.imageUrl);
+      cur.headerUrl ??= normalizeImageUrl(info.header);
       for (const w of info.websites ?? []) {
         const url = typeof w === "string" ? w : w?.url;
         if (url) cur.websites.push(String(url));

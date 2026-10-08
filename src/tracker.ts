@@ -3,6 +3,11 @@ import type { OrderEntry, TokenInfo, TokenSocial } from "./dexscreener/client.js
 import { fetchOrders, fetchTokenInfo } from "./dexscreener/client.js";
 import { createHash } from "node:crypto";
 
+/** How long an order check keeps retrying after a profile appears/changes. */
+export const ORDER_CHECK_WINDOW_MS = 10 * 60_000;
+/** Retry delays between order checks (ms), capped at the last entry. */
+const ORDER_RETRY_BACKOFF_MS = [15_000, 30_000, 60_000, 120_000];
+
 export const PROFILE_ORDER_TYPE = "tokenProfile";
 
 export interface SocialDiff {
@@ -62,13 +67,43 @@ export function diffSocials(prev: SnapshotRow | undefined, next: TokenInfo): Soc
   return { websitesAdded, websitesRemoved, socialsAdded, socialsRemoved };
 }
 
-export function infoToSnapshotRow(mint: string, info: TokenInfo, now: number): SnapshotRow {
+/**
+ * Stable hash over everything that makes up a token's DEX Screener profile.
+ * Order-independent (sorted, deduped) and ignores image size/cache params.
+ */
+export function fingerprintOf(info: TokenInfo): string {
+  const parts = [
+    info.imageUrl ?? "",
+    info.headerUrl ?? "",
+    JSON.stringify([...new Set(info.websites)].sort()),
+    JSON.stringify(info.socials.map((s) => `${s.type}|${s.url}`).sort()),
+  ];
+  return createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 32);
+}
+
+/** A profile counts as "full" once it has an icon, a banner and any link. */
+export function isFullInfo(info: TokenInfo): boolean {
+  return Boolean(
+    info.hasInfo && info.imageUrl && info.headerUrl && (info.websites.length || info.socials.length)
+  );
+}
+
+export function infoToSnapshotRow(
+  mint: string,
+  info: TokenInfo,
+  now: number,
+  pendingFingerprint: string | null = null
+): SnapshotRow {
   return {
     base_mint: mint,
     websites_json: JSON.stringify([...new Set(info.websites)].sort()),
     socials_json: JSON.stringify(info.socials),
     has_info: info.hasInfo ? 1 : 0,
     updated_at: now,
+    image_url: info.imageUrl,
+    header_url: info.headerUrl,
+    info_fingerprint: fingerprintOf(info),
+    pending_fingerprint: pendingFingerprint,
   };
 }
 
@@ -143,7 +178,7 @@ export async function pollOrders(
       base_mint: mint,
       order_type: o.type,
       status: o.status,
-      payment_ts: o.paymentTimestamp ?? null,
+      payment_ts: o.paymentTimestamp ?? 0,
       updated_at: now,
     });
   }
@@ -168,11 +203,126 @@ export async function pollOrders(
   return { changes, baseline };
 }
 
+export interface SocialPollResult {
+  /** Mints whose DEX Screener data was present in this response. */
+  seen: string[];
+  /** Mints that got a baseline recorded this call (silent, no alert). */
+  baselined: string[];
+  /** Mints for which an order check was queued. */
+  orderChecksQueued: string[];
+  /** Mints for which a social-change alert was enqueued. */
+  alerted: string[];
+}
+
 /**
- * Poll social info for a batch of mints (<=30), diff + enqueue. With
- * `opts.silent` (baseline pass) snapshots are recorded without alerts.
- * Returns the mints whose DEX Screener data was actually present, so the caller
- * can tell which baselines are safe to mark done.
+ * Process one batch (<=30) of DEX Screener token info for already-monitored
+ * launches. For each mint, ALL of the following happen in one SQLite transaction
+ * so a crash can never record the new snapshot but lose the alert/job:
+ *
+ *   - first valid response  -> record snapshot + mark baseline done, NO social
+ *     alert (the starting state is not an "update"). If that starting profile is
+ *     already full, queue ONE order check (it may have paid before our first
+ *     poll) — still no social alert.
+ *   - later responses       -> diff websites/socials; alert on real changes.
+ *   - profile appeared or its fingerprint changed -> queue an order check.
+ *     (The info change is only a hint; only an order from the orders endpoint
+ *     produces a paid alert.)
+ *   - a change that only REMOVES things is applied after it is seen twice in a
+ *     row, so one thin DEX Screener response does not read as "dev deleted it".
+ *
+ * An absent mint is never treated as a removal; it simply is not in `seen`.
+ */
+export function applySocialBatch(
+  deps: TrackerDeps,
+  mints: string[],
+  infos: Map<string, TokenInfo>,
+  now: number = Date.now(),
+  opts: PollOpts = {}
+): SocialPollResult {
+  const result: SocialPollResult = { seen: [], baselined: [], orderChecksQueued: [], alerted: [] };
+
+  const tx = deps.db.raw.transaction(() => {
+    for (const mint of mints) {
+      const info = infos.get(mint);
+      if (!info || !info.present) continue;
+      result.seen.push(mint);
+
+      const launch = deps.db.getLaunchByMint(mint);
+      const prev = deps.db.getSnapshot(mint);
+      const fp = fingerprintOf(info);
+      const firstSnapshot = prev === undefined || launch?.baseline_done !== 1;
+
+      if (firstSnapshot || opts.silent) {
+        // Starting state: record it, don't announce it.
+        deps.db.upsertSnapshot(infoToSnapshotRow(mint, info, now));
+        if (launch && launch.baseline_done !== 1) {
+          deps.db.setBaselineDone(mint);
+          result.baselined.push(mint);
+        }
+        if (!opts.silent && isFullInfo(info) && launch?.origin === "live") {
+          deps.db.enqueueOrderCheck(mint, "baseline_info", now, ORDER_CHECK_WINDOW_MS);
+          result.orderChecksQueued.push(mint);
+        }
+        continue;
+      }
+
+      const diff = diffSocials(prev, info);
+      const prevFp = prev?.info_fingerprint ?? null;
+
+      // Removal-only changes need a second consecutive sighting before applying.
+      const onlyRemovals =
+        diff !== null &&
+        diff.websitesAdded.length === 0 &&
+        diff.socialsAdded.length === 0 &&
+        (diff.websitesRemoved.length > 0 || diff.socialsRemoved.length > 0);
+      if (onlyRemovals && prev?.pending_fingerprint !== fp) {
+        deps.db.upsertSnapshot({ ...prev!, pending_fingerprint: fp, updated_at: now });
+        continue;
+      }
+
+      deps.db.upsertSnapshot(infoToSnapshotRow(mint, info, now));
+
+      // Profile appeared or changed -> check orders (once; deadline-bounded).
+      const hadProfile = Boolean(prev && prev.has_info === 1 && prevFp);
+      const profileChanged = prevFp !== null && prevFp !== fp;
+      if (info.hasInfo && (!hadProfile || profileChanged)) {
+        deps.db.enqueueOrderCheck(
+          mint,
+          hadProfile ? "info_changed" : "info_appeared",
+          now,
+          ORDER_CHECK_WINDOW_MS
+        );
+        result.orderChecksQueued.push(mint);
+      }
+
+      if (!diff) continue;
+      const key = eventKey([
+        "social",
+        mint,
+        JSON.stringify(diff.websitesAdded),
+        JSON.stringify(diff.websitesRemoved),
+        JSON.stringify(diff.socialsAdded.map((s) => s.url)),
+        JSON.stringify(diff.socialsRemoved.map((s) => s.url)),
+      ]);
+      if (
+        deps.db.enqueueEvent({
+          eventKey: key,
+          baseMint: mint,
+          kind: "social",
+          text: deps.formatSocial(mint, diff, false, info),
+        })
+      ) {
+        result.alerted.push(mint);
+      }
+    }
+  });
+  tx();
+  return result;
+}
+
+/**
+ * Fetch + apply one social batch. Kept as a thin wrapper so tests and callers
+ * can inject the fetcher. Returns the mints present in the response.
  */
 export async function pollSocials(
   deps: TrackerDeps,
@@ -182,68 +332,47 @@ export async function pollSocials(
 ): Promise<string[]> {
   if (mints.length === 0) return [];
   const infos = await fetchInfoFn(mints);
-  const now = Date.now();
-  const seen: string[] = [];
-
-  for (const mint of mints) {
-    const info = infos.get(mint);
-    if (!info || !info.present) continue; // absent response != removal
-    seen.push(mint);
-
-    const prev = deps.db.getSnapshot(mint);
-    const diff = diffSocials(prev, info);
-    deps.db.upsertSnapshot(infoToSnapshotRow(mint, info, now));
-
-    if (opts.silent || !diff) continue;
-
-    const key = eventKey([
-      "social",
-      mint,
-      JSON.stringify(diff.websitesAdded),
-      JSON.stringify(diff.websitesRemoved),
-      JSON.stringify(diff.socialsAdded.map((s) => s.url)),
-      JSON.stringify(diff.socialsRemoved.map((s) => s.url)),
-    ]);
-    deps.db.enqueueEvent({
-      eventKey: key,
-      baseMint: mint,
-      kind: "social",
-      text: deps.formatSocial(mint, diff, false, info),
-    });
-  }
-  return seen;
+  return applySocialBatch(deps, mints, infos, Date.now(), opts).seen;
 }
 
 /**
- * Silent baseline pass for one launch.
- *
- * Socials are always recorded silently first: a live launch's initial socials
- * are the starting state, and only later edits are "updates".
- *
- * Orders are different. A token seen live at launch cannot have paid before we
- * watched it, so any tokenProfile order we read is new and must alert — it is
- * NOT baselined. Only `origin: "backfill"` launches (which may have paid before
- * we started watching) record orders silently.
- *
- * If DEX Screener has no pair data for the mint yet, the baseline is NOT marked
- * done (retried next cycle) so the first appearance is not mistaken for a change.
- *
- * Returns true when the baseline was completed.
+ * Backoff for the Nth failed/empty order check, with a little jitter.
  */
-export async function seedBaseline(
+export function orderRetryDelayMs(attempts: number, rand: () => number = Math.random): number {
+  const base = ORDER_RETRY_BACKOFF_MS[Math.min(attempts, ORDER_RETRY_BACKOFF_MS.length - 1)]!;
+  return Math.round(base * (0.85 + rand() * 0.3));
+}
+
+export type OrderCheckOutcome = "done" | "retry" | "expired";
+
+/**
+ * Run one due order check. A tokenProfile order that is `approved`, `rejected`
+ * or `cancelled` ends the job; `processing`/`on-hold`/nothing yet retries until
+ * the deadline. Alerts are produced by `pollOrders` (deduped by event key), so a
+ * retry that re-reads the same order never alerts twice.
+ */
+export async function runOrderCheck(
   deps: TrackerDeps,
   mint: string,
-  fns: {
-    fetchOrders?: (m: string) => Promise<OrderEntry[]>;
-    fetchInfo?: (m: string[]) => Promise<Map<string, TokenInfo>>;
-    origin?: string;
-  } = {}
-): Promise<boolean> {
-  if (fns.origin === "backfill") {
-    await pollOrders(deps, mint, fns.fetchOrders ?? fetchOrders, { silent: true });
+  fns: { fetchOrders?: (m: string) => Promise<OrderEntry[]>; now?: number } = {}
+): Promise<OrderCheckOutcome> {
+  const now = fns.now ?? Date.now();
+  const job = deps.db.getOrderCheck(mint);
+  if (!job || job.status !== "pending") return "done";
+
+  const { changes } = await pollOrders(deps, mint, fns.fetchOrders ?? fetchOrders);
+  const orders = deps.db.getOrders(mint).filter((o) => o.order_type === PROFILE_ORDER_TYPE);
+  const terminal = orders.some((o) => ["approved", "rejected", "cancelled"].includes(o.status));
+  void changes;
+
+  if (terminal) {
+    deps.db.finishOrderCheck(mint, "done");
+    return "done";
   }
-  const seen = await pollSocials(deps, [mint], fns.fetchInfo ?? fetchTokenInfo, { silent: true });
-  if (!seen.includes(mint)) return false;
-  deps.db.setBaselineDone(mint);
-  return true;
+  if (now >= job.deadline_at) {
+    deps.db.finishOrderCheck(mint, "expired");
+    return "expired";
+  }
+  deps.db.retryOrderCheck(mint, now + orderRetryDelayMs(job.attempts));
+  return "retry";
 }

@@ -11,20 +11,22 @@ Only tokens whose **creator wallet has launched ≤ N DBC pools** (default 10, i
 
 ## How it works
 
-1. **Launch watcher** subscribes to DBC program logs via Helius WebSocket, decodes `EvtInitializePool`, and records `{pool, creator, baseMint}`. On restart it backfills from the last cursor signature.
-2. **Creator history** counts a creator's DBC pools with `client.state.getPoolsByCreator`. If the count can't be proven complete, the creator is marked `unknown` and re-checked — it is **not** treated as 0.
-3. **Tracker** polls DEX Screener per eligible token:
-   - `GET /orders/v1/solana/{mint}` for paid `tokenProfile` status (docs: 60 req/min).
-   - token batch endpoint for `info.websites` / `info.socials` (docs: 300 req/min).
-   The first poll is a **baseline** (labelled "first seen"); later changes are diffed.
-4. **Telegram outbox** stores alerts in SQLite and a worker delivers them with retry + 429 backoff.
+1. **Launch watcher** subscribes to DBC program logs via Helius WebSocket, decodes `EvtInitializePool` from the transaction's inner instructions, and records `{pool, creator, baseMint}` immediately. The token is monitored right away.
+2. **Creator check** runs in its own worker (a heavy RPC scan, `getProgramAccountsV2` with pagination). The mint being evaluated is always counted. A creator with more than `MAX_CREATOR_LAUNCHES` (inclusive limit) is dropped for good. If the check fails or cannot be proven complete, the creator is `unknown`: monitoring continues, retries back off, and alerts for that token are **held** (not sent, not lost) until a verdict arrives — eligible releases them, ineligible discards them.
+3. **Social worker** refreshes DEX Screener token info in batches of 30 (one request per 30 tokens). The first response per token is a silent baseline; later link changes are diffed and alerted. A removal must be seen twice in a row before it counts.
+4. **Order worker** drains a durable queue. A token's orders are checked **only** when its profile appears or changes (icon, banner, website, socials) — never by polling every token. Each check retries with backoff for up to 10 minutes, then gives up until the profile changes again. Only an order of type `tokenProfile` produces a paid alert.
+5. **Telegram outbox** stores alerts in SQLite; a worker delivers them with retry + 429 backoff.
 
-### Important limitations
+The three workers are independent and use separate rate limits, so a backlog in one cannot delay the others.
 
-- **Not real-time.** The orders endpoint has no batch form; more tracked tokens means longer polling cycles. The bot stays under documented rate limits rather than guaranteeing latency.
+### Limitations
+
+- **A profile change is a trigger, not proof of payment.** The orders endpoint reports `tokenProfile` orders but not the USD amount, so alerts say "Enhanced Token Info", not a verified price. A payment that never changes the profile, or whose order shows up after the 10-minute retry window, can be missed.
+- **Not real-time.** Launch detection takes about a second. Profile changes are seen on the next social refresh (`POLL_INTERVAL_SECONDS`, default 60), plus API latency; 429s add delay.
+- **Creator history is not a full lifetime record.** The scan sees pools a wallet currently holds, plus launches this bot saw it create. A pool transferred to another wallet before the bot was watching is invisible. `eligible` therefore means "no more than N launches we can see", while `ineligible` is proven.
 - **Delivery is at-least-once.** A timeout after a successful send can duplicate a message.
-- **History completeness depends on your RPC.** If Helius can't return a creator's full pool history, eligibility is `unknown` until proven.
-- Example mints are **not** assumed to be DBC until found on-chain. Use `npm run inspect` to check one.
+- Startup backfill of the last 24h is off by default (`BACKFILL_MAX_TX=0`); the DBC program is too busy for a signature scan to reach back that far.
+- `npm run inspect -- <mint>` and `npm run diagnose [-- <mint>]` are read-only tools for checking a token and the queues.
 
 ## Setup
 
@@ -67,7 +69,8 @@ npm test
 | `DRY_RUN` | `true` = log instead of send (default). |
 | `MAX_CREATOR_LAUNCHES` | Eligibility cap, inclusive (default 10). |
 | `WATCH_WINDOW_MINUTES` | How long to poll a token after launch (default 1440). |
-| `ORDERS_RPM` / `TOKENS_RPM` | Polling budgets, kept under DEX Screener limits. |
+| `ORDERS_RPM` / `TOKENS_RPM` | Rate budgets, kept under DEX Screener limits. |
+| `POLL_INTERVAL_SECONDS` | How often each token's profile is refreshed (default 60). |
 | `ALERT_ON_LAUNCH` | `true` = also message on every new eligible launch (default `false`). |
 | `DATABASE_PATH` | SQLite file (default `./data/tracker.db`). |
 
