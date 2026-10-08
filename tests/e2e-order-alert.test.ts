@@ -38,6 +38,7 @@ describe("live launch -> paid profile, through PollScheduler", () => {
       pool: "p", base_mint: "m", creator: "c", signature: null,
       detected_at: clock, watch_until: clock + 86_400_000, eligible: true, origin: "live",
     });
+    db.upsertCreator("c", 1, "eligible");
     const sch = new PollScheduler(db, deps(db), { ordersRpm: 6000, tokensRpm: 6000, pollIntervalMs: 60_000 }, {
       now: () => clock,
       fetchInfo: async (mints) => new Map(mints.map((m) => [m, info])),

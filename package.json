@@ -16,6 +16,7 @@
     "inspect": "tsx src/scripts/inspect-mint.ts",
     "test-latest": "tsx src/scripts/test-latest.ts",
     "diagnose": "tsx src/scripts/diagnose.ts",
+    "recover-dryrun": "tsx src/scripts/recover-dryrun.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

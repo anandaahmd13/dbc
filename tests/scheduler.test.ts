@@ -173,3 +173,116 @@ describe("PollScheduler at production scale (1378 tokens)", () => {
     db.close();
   });
 });
+
+describe("creator worker", () => {
+  const deps = (db: Db): TrackerDeps => ({ db, formatOrder: () => "", formatSocial: () => "" });
+  function pendingLaunch(db: Db, mint: string, creator: string, detected: number) {
+    db.insertLaunch({
+      pool: `p-${mint}`, base_mint: mint, creator, signature: null, detected_at: detected,
+      watch_until: detected + 86_400_000, eligible: false, pendingCreator: true,
+    });
+  }
+
+  it("verifies launches that already have a held alert before bulk backlog", async () => {
+    const db = new Db(":memory:");
+    const t = Date.now();
+    for (let i = 0; i < 6; i++) pendingLaunch(db, `old${i}`, `cOld${i}`, t - 1000 + i); // newer-first among these
+    pendingLaunch(db, "waiting", "cWaiting", t - 500_000);                              // oldest, but has a held alert
+    db.enqueueEvent({ eventKey: "k", baseMint: "waiting", kind: "order", text: "paid" });
+    const order: string[] = [];
+    const sch = new PollScheduler(db, deps(db), { ordersRpm: 50, tokensRpm: 240, pollIntervalMs: 60_000 }, {
+      now: () => t, sleep: async () => {},
+      verifyCreator: async (_c, mint) => (order.push(mint), "eligible"),
+    });
+    await sch.creatorStep();
+    expect(order[0]).toBe("waiting");
+    db.close();
+  });
+
+  it("an unknown verdict stays monitored, backs off, and keeps its alert held", async () => {
+    const db = new Db(":memory:");
+    const t = Date.now();
+    pendingLaunch(db, "m", "c", t);
+    db.enqueueEvent({ eventKey: "k", baseMint: "m", kind: "order", text: "paid" });
+    const sch = new PollScheduler(db, deps(db), { ordersRpm: 50, tokensRpm: 240, pollIntervalMs: 60_000 }, {
+      now: () => t, sleep: async () => {}, verifyCreator: async () => "unknown",
+    });
+    await sch.creatorStep();
+    const l = db.getLaunchByMint("m")!;
+    expect(l.pending_creator).toBe(1);
+    expect(l.creator_attempts).toBe(1);
+    expect(l.creator_next_check_at).toBeGreaterThan(t);
+    expect(db.claimPendingOutbox(t, 10)).toHaveLength(0); // still held
+    db.close();
+  });
+
+  it("an eligible verdict releases every held alert of that creator's pending launches", async () => {
+    const db = new Db(":memory:");
+    const t = Date.now();
+    pendingLaunch(db, "a", "c", t);
+    pendingLaunch(db, "b", "c", t - 10);
+    db.enqueueEvent({ eventKey: "ka", baseMint: "a", kind: "order", text: "A" });
+    db.enqueueEvent({ eventKey: "kb", baseMint: "b", kind: "social", text: "B" });
+    db.upsertCreator("c", 2, "eligible");
+    const sch = new PollScheduler(db, deps(db), { ordersRpm: 50, tokensRpm: 240, pollIntervalMs: 60_000 }, {
+      now: () => t, sleep: async () => {}, verifyCreator: async () => "eligible",
+    });
+    await sch.creatorStep();
+    expect(db.claimPendingOutbox(t, 10).map((r) => r.text).sort()).toEqual(["A", "B"]);
+    expect(db.getLaunchByMint("a")!.pending_creator).toBe(0);
+    db.close();
+  });
+
+  it("an ineligible verdict stops monitoring and discards held alerts", async () => {
+    const db = new Db(":memory:");
+    const t = Date.now();
+    pendingLaunch(db, "m", "serial", t);
+    db.enqueueEvent({ eventKey: "k", baseMint: "m", kind: "order", text: "paid" });
+    const sch = new PollScheduler(db, deps(db), { ordersRpm: 50, tokensRpm: 240, pollIntervalMs: 60_000 }, {
+      now: () => t, sleep: async () => {}, verifyCreator: async () => "ineligible",
+    });
+    await sch.creatorStep();
+    expect(db.claimPendingOutbox(t, 10)).toHaveLength(0);
+    expect((db.raw.prepare("SELECT status FROM outbox").get() as { status: string }).status).toBe("dropped");
+    expect(db.dueLaunches(t + 1, 10)).toHaveLength(0); // no longer polled
+    db.close();
+  });
+
+  it("paces verification instead of hammering the RPC", async () => {
+    const db = new Db(":memory:");
+    const t = Date.now();
+    for (let i = 0; i < 3; i++) pendingLaunch(db, `m${i}`, `c${i}`, t - i);
+    const waits: number[] = [];
+    const sch = new PollScheduler(db, deps(db), { ordersRpm: 50, tokensRpm: 240, pollIntervalMs: 60_000 }, {
+      now: () => t, sleep: async (ms) => void waits.push(ms), verifyCreator: async () => "eligible",
+    });
+    await sch.creatorStep();
+    expect(waits.filter((w) => w >= 500)).toHaveLength(3); // a pause after each of the 3 scans
+    db.close();
+  });
+});
+
+describe("baseline retry backoff", () => {
+  it("a token DEX Screener never indexes backs off 15s -> 30s -> 60s and stops crowding batches", async () => {
+    const db = new Db(":memory:");
+    let clock = 1_000_000_000_000;
+    db.insertLaunch({
+      pool: "p", base_mint: "ghost", creator: "c", signature: null,
+      detected_at: clock, watch_until: clock + 86_400_000, eligible: true,
+    });
+    const sch = new PollScheduler(db, { db, formatOrder: () => "", formatSocial: () => "" },
+      { ordersRpm: 50, tokensRpm: 240, pollIntervalMs: 60_000 }, {
+        now: () => clock, sleep: async (ms) => void (clock += ms),
+        fetchInfo: async (m) => new Map(m.map((x) => [x, emptyTokenInfo()])),
+      });
+    const gaps: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      await sch.socialStep();
+      const next = db.getLaunchByMint("ghost")!.next_poll_at;
+      gaps.push(next - clock);
+      clock = next; // wait until it is due again
+    }
+    expect(gaps).toEqual([15_000, 30_000, 60_000, 60_000, 60_000]); // capped at the poll interval
+    db.close();
+  });
+});

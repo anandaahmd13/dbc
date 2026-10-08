@@ -69,6 +69,9 @@ export interface SchedulerConfig {
 }
 
 const BATCH = 30;
+/** Creators verified per step, and the pause after each (RPC politeness). */
+const CREATOR_BATCH = 3;
+const CREATOR_PACE_MS = 600;
 /** Retry delay when a launch has no DEX Screener pair data yet. */
 const NO_DATA_RETRY_MS = 15_000;
 
@@ -106,6 +109,7 @@ export class PollScheduler {
   private readonly abort = new AbortController();
   private running: Promise<void>[] = [];
   private readonly now: () => number;
+  private readonly wait: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(
     private readonly db: Db,
@@ -115,6 +119,7 @@ export class PollScheduler {
   ) {
     this.now = hooks.now ?? Date.now;
     const wait = hooks.sleep ?? sleep;
+    this.wait = (ms) => wait(ms, this.abort.signal).catch(() => {});
     this.ordersRl = new RateLimiter(cfg.ordersRpm, this.now, undefined, wait);
     this.tokensRl = new RateLimiter(cfg.tokensRpm, this.now, undefined, wait);
   }
@@ -183,11 +188,13 @@ export class PollScheduler {
       true
     );
     // Not indexed yet (or thin response): try again soon, never read as removal.
-    this.db.reschedulePolls(
-      mints.filter((m) => !seen.has(m)),
-      next + NO_DATA_RETRY_MS,
-      false
-    );
+    // Back off per token (15s, 30s, 60s ...) up to the normal interval so tokens
+    // DEX Screener never indexes stop crowding batches meant for live ones.
+    for (const m of mints.filter((x) => !seen.has(x))) {
+      const attempts = this.db.getLaunchByMint(m)?.poll_attempts ?? 0;
+      const delay = Math.min(NO_DATA_RETRY_MS * 2 ** attempts, this.cfg.pollIntervalMs);
+      this.db.reschedulePolls([m], next + delay, false);
+    }
     if (res.baselined.length || res.orderChecksQueued.length || res.alerted.length) {
       log.debug(
         `socials batch=${mints.length} seen=${seen.size} baselined=${res.baselined.length} ` +
@@ -228,7 +235,7 @@ export class PollScheduler {
   async creatorStep(): Promise<number> {
     const verify = this.hooks.verifyCreator;
     if (!verify) return 0;
-    const jobs = this.db.launchesAwaitingCreator(this.now(), 3);
+    const jobs = this.db.launchesAwaitingCreatorPrioritized(this.now(), CREATOR_BATCH);
     for (const job of jobs) {
       if (this.abort.signal.aborted) return jobs.length;
       let verdict: "eligible" | "ineligible" | "unknown" = "unknown";
@@ -237,6 +244,9 @@ export class PollScheduler {
       } catch (err) {
         log.warn(`creator verification error for ${job.creator}`, err instanceof Error ? err.message : String(err));
       }
+      // Pace the scans: ~1 per CREATOR_PACE_MS so re-verifying a large backlog
+      // can never hammer the RPC (each scan is a heavy getProgramAccounts call).
+      await this.wait(CREATOR_PACE_MS);
       if (verdict === "unknown") {
         // 10s, 20s, 40s ... capped at 5 min, with jitter.
         const delay = Math.min(10_000 * 2 ** job.creator_attempts, 300_000);

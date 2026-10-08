@@ -47,6 +47,7 @@ function addLaunch(db: Db, mint = "m", origin: "live" | "backfill" = "live") {
     pool: `p-${mint}`, base_mint: mint, creator: "c", signature: null,
     detected_at: Date.now(), watch_until: Date.now() + 3_600_000, eligible: true, origin,
   });
+  db.upsertCreator("c", 1, "eligible"); // verified, so alerts are sent rather than held
 }
 
 describe("diffSocials", () => {
@@ -111,6 +112,7 @@ describe("pollOrders", () => {
 
   it("silent pass records state but never alerts", async () => {
     const db = new Db(":memory:");
+    addLaunch(db);
     const r = await pollOrders(deps(db), "m", stub("approved"), { silent: true });
     expect(r.baseline).toBe(true);
     expect(db.getOrders("m")).toHaveLength(1);
@@ -120,6 +122,7 @@ describe("pollOrders", () => {
 
   it("alerts a transition exactly once", async () => {
     const db = new Db(":memory:");
+    addLaunch(db);
     const d = deps(db);
     await pollOrders(d, "m", stub("processing"), { silent: true });
     expect((await pollOrders(d, "m", stub("processing"))).changes).toHaveLength(0);
@@ -132,6 +135,7 @@ describe("pollOrders", () => {
 
   it("an order without paymentTimestamp is one row, not one per poll", async () => {
     const db = new Db(":memory:");
+    addLaunch(db);
     const d = deps(db);
     const noTs = async () => [{ type: PROFILE_ORDER_TYPE, status: "approved" } as OrderEntry];
     for (let i = 0; i < 3; i++) await pollOrders(d, "m", noTs);
@@ -395,5 +399,26 @@ describe("parseOrders", () => {
     expect(parseOrders({})).toEqual([]);
     expect(parseOrders({ orders: "nope" })).toEqual([]);
     expect(parseOrders("x")).toEqual([]);
+  });
+});
+
+describe("paid-alert age label", () => {
+  it("shows how long ago it was paid and flags a late catch-up", async () => {
+    const { makeOrderFormatter, formatAge } = await import("../src/format.js");
+    const now = 1_800_000_000_000;
+    const fmt = makeOrderFormatter(() => ({ creator: "c", launchCount: 1 }), () => now);
+    const fresh = fmt("m", { type: "tokenProfile", status: "approved", paymentTimestamp: now - 2 * 60_000 }, false);
+    expect(fresh).toContain("Paid: 2 min ago");
+    expect(fresh).not.toContain("late");
+    const late = fmt("m", { type: "tokenProfile", status: "approved", paymentTimestamp: now - 93 * 60_000 }, false);
+    expect(late).toContain("Paid: 1 h 33 min ago (late catch-up)");
+    expect(formatAge(now - 20_000, now)).toBe("just now");
+    expect(formatAge(now - 30_000, now)).toBe("1 min ago"); // rounds to the nearest minute
+    expect(formatAge(now - 3 * 3_600_000, now)).toBe("3 h ago");
+  });
+  it("omits the line when there is no usable timestamp", async () => {
+    const { makeOrderFormatter } = await import("../src/format.js");
+    const fmt = makeOrderFormatter(() => ({ creator: "c", launchCount: 1 }), () => 1_800_000_000_000);
+    expect(fmt("m", { type: "tokenProfile", status: "approved" }, false)).not.toContain("Paid:");
   });
 });

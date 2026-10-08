@@ -7,15 +7,18 @@ export class TelegramError extends Error {
   }
 }
 
+/** "sent" = delivered to Telegram; "dryrun" = only logged (nothing left the machine). */
+export type SendResult = "sent" | "dryrun";
+
 export interface TelegramSender {
-  send(text: string): Promise<void>;
+  send(text: string): Promise<SendResult | void>;
 }
 
 /** Real Telegram sender (HTML parse mode). */
 export class TelegramClient implements TelegramSender {
   constructor(private readonly botToken: string, private readonly chatId: string) {}
 
-  async send(text: string): Promise<void> {
+  async send(text: string): Promise<SendResult> {
     const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
     const res = await fetch(url, {
       method: "POST",
@@ -42,13 +45,15 @@ export class TelegramClient implements TelegramSender {
       const body = await res.text().catch(() => "");
       throw new TelegramError(`Telegram HTTP ${res.status}: ${body.slice(0, 200)}`, res.status);
     }
+    return "sent";
   }
 }
 
 /** Dry-run sender: logs instead of sending. */
 export class DryRunSender implements TelegramSender {
-  async send(text: string): Promise<void> {
+  async send(text: string): Promise<SendResult> {
     log.info("[DRY_RUN] would send Telegram message:\n" + text);
+    return "dryrun";
   }
 }
 

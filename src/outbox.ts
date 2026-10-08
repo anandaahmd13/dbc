@@ -33,8 +33,11 @@ export class OutboxWorker {
     const batch = this.db.claimPendingOutbox(now, 10);
     for (const row of batch) {
       try {
-        await this.sender.send(row.text);
-        this.db.markOutboxSent(row.id);
+        const result = await this.sender.send(row.text);
+        // A dry run only logged the text. Marking it 'sent' would burn the alert
+        // forever (its event key is already recorded), so keep it recoverable.
+        if (result === "dryrun") this.db.markOutboxDryRun(row.id);
+        else this.db.markOutboxSent(row.id);
       } catch (err) {
         this.onError(row.id, row.attempts, err);
       }

@@ -5,9 +5,19 @@ function mem() {
   return new Db(":memory:");
 }
 
+/** A launch whose creator is proven eligible, so its alerts are sent, not held. */
+export function verifiedLaunch(db: Db, mint = "m", creator = "c") {
+  db.insertLaunch({
+    pool: `p-${mint}`, base_mint: mint, creator, signature: null,
+    detected_at: Date.now(), watch_until: Date.now() + 3_600_000, eligible: true,
+  });
+  db.upsertCreator(creator, 1, "eligible");
+}
+
 describe("Db enqueueEvent dedup", () => {
   it("enqueues once per event key and writes outbox atomically", () => {
     const db = mem();
+    verifiedLaunch(db);
     const first = db.enqueueEvent({ eventKey: "k1", baseMint: "m", kind: "order", text: "hi" });
     const second = db.enqueueEvent({ eventKey: "k1", baseMint: "m", kind: "order", text: "hi" });
     expect(first).toBe(true);
@@ -20,6 +30,7 @@ describe("Db enqueueEvent dedup", () => {
 
   it("outbox lifecycle: sent / retry", () => {
     const db = mem();
+    verifiedLaunch(db);
     db.enqueueEvent({ eventKey: "k2", baseMint: "m", kind: "social", text: "x" });
     const [row] = db.claimPendingOutbox(Date.now());
     db.markOutboxRetry(row!.id, Date.now() + 10_000, "boom");
@@ -69,6 +80,7 @@ describe("Db migrations", () => {
       "002-baseline.sql",
       "003-launch-origin.sql",
       "004-monitoring-queues.sql",
+      "005-reverify-legacy.sql",
     ]);
     db.insertLaunch({
       pool: "p", base_mint: "m", creator: "c", signature: null,
@@ -178,6 +190,106 @@ describe("migration 004 on a production-shaped database", () => {
       expect(db.getCreator("serial")!.eligibility).toBe("ineligible");
       db.close();
       new Db(path).close(); // reopening must not re-run 004
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("fail-closed alerting", () => {
+  const mk = (db: Db, creator: string, opts: { eligible: boolean; pending: boolean }) =>
+    db.insertLaunch({
+      pool: "p", base_mint: "m", creator, signature: null, detected_at: Date.now(),
+      watch_until: Date.now() + 3_600_000, eligible: opts.eligible, pendingCreator: opts.pending,
+    });
+  const status = (db: Db) =>
+    (db.raw.prepare("SELECT status FROM outbox").all() as { status: string }[]).map((r) => r.status);
+
+  it("holds an alert when the launch looks eligible but its creator verdict is unknown (the legacy-row leak)", () => {
+    const db = mem();
+    mk(db, "c", { eligible: true, pending: false }); // old row: flag says fine
+    db.upsertCreator("c", null, "unknown");           // ...but 004 reset the verdict
+    db.enqueueEvent({ eventKey: "k", baseMint: "m", kind: "order", text: "x" });
+    expect(status(db)).toEqual(["held"]);
+    db.close();
+  });
+
+  it("holds when there is no creator row at all", () => {
+    const db = mem();
+    mk(db, "ghost", { eligible: true, pending: false });
+    db.enqueueEvent({ eventKey: "k", baseMint: "m", kind: "order", text: "x" });
+    expect(status(db)).toEqual(["held"]);
+    db.close();
+  });
+
+  it("holds when the mint has no launch row", () => {
+    const db = mem();
+    db.enqueueEvent({ eventKey: "k", baseMint: "nope", kind: "order", text: "x" });
+    expect(status(db)).toEqual(["held"]);
+    db.close();
+  });
+
+  it("sends immediately when both the launch and creator are verified eligible", () => {
+    const db = mem();
+    verifiedLaunch(db);
+    db.enqueueEvent({ eventKey: "k", baseMint: "m", kind: "order", text: "x" });
+    expect(status(db)).toEqual(["pending"]);
+    db.close();
+  });
+
+  it("verdict eligible releases held alerts; ineligible drops them", () => {
+    const db = mem();
+    mk(db, "c", { eligible: false, pending: true });
+    db.enqueueEvent({ eventKey: "k1", baseMint: "m", kind: "order", text: "x" });
+    expect(status(db)).toEqual(["held"]);
+    db.upsertCreator("c", 2, "eligible");
+    expect(db.resolveCreator("m", true)).toEqual({ released: 1, dropped: 0 });
+    expect(status(db)).toEqual(["pending"]);
+
+    const db2 = mem();
+    mk(db2, "c", { eligible: false, pending: true });
+    db2.enqueueEvent({ eventKey: "k1", baseMint: "m", kind: "order", text: "x" });
+    expect(db2.resolveCreator("m", false)).toEqual({ released: 0, dropped: 1 });
+    expect(status(db2)).toEqual(["dropped"]);
+    db.close();
+    db2.close();
+  });
+});
+
+describe("migration 005 on a production-shaped database", () => {
+  it("re-queues verification for monitored launches whose creator is not proven, and leaves proven ones", async () => {
+    const { mkdtempSync, rmSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const Database = (await import("better-sqlite3")).default;
+    const dir = mkdtempSync(join(tmpdir(), "dbc-m5-"));
+    const path = join(dir, "prod.db");
+    try {
+      const old = new Database(path);
+      old.exec("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)");
+      for (const f of ["001-init.sql", "002-baseline.sql", "003-launch-origin.sql", "004-monitoring-queues.sql"]) {
+        old.exec(readFileSync(join(process.cwd(), "src/migrations", f), "utf8"));
+        old.prepare("INSERT INTO schema_migrations VALUES (?, 1)").run(f);
+      }
+      const future = Date.now() + 3_600_000;
+      const ins = old.prepare(
+        "INSERT INTO launches (pool, base_mint, creator, detected_at, watch_until, eligible) VALUES (?,?,?,1,?,1)"
+      );
+      ins.run("p1", "unproven", "cU", future);
+      ins.run("p2", "proven", "cP", future);
+      ins.run("p3", "expired", "cU", Date.now() - 1000);
+      old.prepare("INSERT INTO creators (address, launch_count, eligibility, checked_at, created_at) VALUES ('cU', NULL, 'unknown', 0, 1)").run();
+      old.prepare("INSERT INTO creators (address, launch_count, eligibility, checked_at, created_at) VALUES ('cP', 2, 'eligible', 5, 1)").run();
+      old.close();
+
+      const db = new Db(path);
+      const l = (m: string) => db.getLaunchByMint(m)!;
+      expect([l("unproven").pending_creator, l("unproven").eligible]).toEqual([1, 0]);
+      expect([l("proven").pending_creator, l("proven").eligible]).toEqual([0, 1]);
+      expect(l("expired").pending_creator).toBe(0); // outside the window: not worth verifying
+      expect(db.launchesAwaitingCreatorPrioritized(Date.now(), 10).map((x) => x.base_mint)).toEqual(["unproven"]);
+      db.close();
+      new Db(path).close(); // reopening must not re-run 005
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -295,12 +295,21 @@ export class Db {
         )
         .run(params.eventKey, params.baseMint, params.kind, now);
       if (ins.changes === 0) return false;
-      // Fail closed: if the launch's creator is not proven <= the limit, park the
-      // message instead of sending it. Verification later releases or drops it.
-      const pending = this.raw
-        .prepare("SELECT pending_creator FROM launches WHERE base_mint = ?")
-        .get(params.baseMint) as { pending_creator: number } | undefined;
-      const hold = pending?.pending_creator === 1;
+      // Fail closed: only send when BOTH the launch and its creator's verdict say
+      // eligible. Anything else (unverified, unknown, no row) parks the message;
+      // verification later releases or drops it. Checking the creators table, not
+      // just a per-launch flag, means a verdict that is later reset to unknown
+      // (or a launch row from before this check existed) cannot leak an alert.
+      const gate = this.raw
+        .prepare(
+          `SELECT l.eligible AS eligible, l.pending_creator AS pending, c.eligibility AS verdict
+           FROM launches l LEFT JOIN creators c ON c.address = l.creator
+           WHERE l.base_mint = ?`
+        )
+        .get(params.baseMint) as
+        | { eligible: number; pending: number; verdict: string | null }
+        | undefined;
+      const hold = !(gate && gate.pending === 0 && gate.eligible === 1 && gate.verdict === "eligible");
       this.raw
         .prepare(
           `INSERT OR IGNORE INTO outbox
@@ -366,6 +375,25 @@ export class Db {
       .all({ now, limit }) as LaunchRow[];
   }
 
+  /**
+   * Pending creator verifications, most urgent first: launches that already have
+   * a held alert or a queued order check, then the newest. Bulk re-verification
+   * of old launches therefore never delays a token someone is waiting on.
+   */
+  launchesAwaitingCreatorPrioritized(now: number, limit: number): LaunchRow[] {
+    return this.raw
+      .prepare(
+        `SELECT l.* FROM launches l
+         WHERE l.pending_creator = 1 AND l.watch_until > @now AND l.creator_next_check_at <= @now
+         ORDER BY
+           (EXISTS (SELECT 1 FROM outbox o WHERE o.base_mint = l.base_mint AND o.status = 'held')
+            OR EXISTS (SELECT 1 FROM order_checks k WHERE k.base_mint = l.base_mint AND k.status = 'pending')) DESC,
+           l.detected_at DESC
+         LIMIT @limit`
+      )
+      .all({ now, limit }) as LaunchRow[];
+  }
+
   rescheduleCreatorCheck(mint: string, nextAt: number): void {
     this.raw
       .prepare(
@@ -399,6 +427,24 @@ export class Db {
          ORDER BY id ASC LIMIT ?`
       )
       .all(now, limit) as OutboxRow[];
+  }
+
+  /**
+   * Dry-run delivery: the message was logged, not sent. It stays recoverable —
+   * switching to live sends it exactly once (`releaseDryRun`).
+   */
+  markOutboxDryRun(id: number): void {
+    this.raw.prepare("UPDATE outbox SET status = 'dryrun' WHERE id = ?").run(id);
+  }
+
+  /** Re-queue messages that were only logged in dry-run, for real delivery. */
+  releaseDryRun(): number {
+    return this.raw
+      .prepare(
+        `UPDATE outbox SET status = 'pending', next_attempt_at = 0
+         WHERE status = 'dryrun'`
+      )
+      .run().changes;
   }
 
   markOutboxSent(id: number): void {
