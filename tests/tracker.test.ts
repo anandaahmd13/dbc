@@ -403,22 +403,27 @@ describe("parseOrders", () => {
 });
 
 describe("paid-alert age label", () => {
-  it("shows how long ago it was paid and flags a late catch-up", async () => {
-    const { makeOrderFormatter, formatAge } = await import("../src/format.js");
+  it("stores a send-time marker, not a frozen age", async () => {
+    const { makeOrderFormatter } = await import("../src/format.js");
+    const { resolvePaidAge } = await import("../src/age.js");
+    const fmt = makeOrderFormatter(() => ({ creator: "c", launchCount: 1 }));
+    const paid = 1_800_000_000_000;
+    const text = fmt("m", { type: "tokenProfile", status: "approved", paymentTimestamp: paid }, false);
+    expect(text).not.toMatch(/Paid: \d/); // nothing frozen in the stored text
+    expect(resolvePaidAge(text, paid + 2 * 60_000)).toContain("Paid: 2 min ago");
+    expect(resolvePaidAge(text, paid + 2 * 60_000)).not.toContain("late");
+    expect(resolvePaidAge(text, paid + 93 * 60_000)).toContain("Paid: 1 h 33 min ago (late catch-up)");
+  });
+  it("formatAge rounds to the nearest minute", async () => {
+    const { formatAge } = await import("../src/age.js");
     const now = 1_800_000_000_000;
-    const fmt = makeOrderFormatter(() => ({ creator: "c", launchCount: 1 }), () => now);
-    const fresh = fmt("m", { type: "tokenProfile", status: "approved", paymentTimestamp: now - 2 * 60_000 }, false);
-    expect(fresh).toContain("Paid: 2 min ago");
-    expect(fresh).not.toContain("late");
-    const late = fmt("m", { type: "tokenProfile", status: "approved", paymentTimestamp: now - 93 * 60_000 }, false);
-    expect(late).toContain("Paid: 1 h 33 min ago (late catch-up)");
     expect(formatAge(now - 20_000, now)).toBe("just now");
-    expect(formatAge(now - 30_000, now)).toBe("1 min ago"); // rounds to the nearest minute
+    expect(formatAge(now - 30_000, now)).toBe("1 min ago");
     expect(formatAge(now - 3 * 3_600_000, now)).toBe("3 h ago");
   });
   it("omits the line when there is no usable timestamp", async () => {
     const { makeOrderFormatter } = await import("../src/format.js");
-    const fmt = makeOrderFormatter(() => ({ creator: "c", launchCount: 1 }), () => 1_800_000_000_000);
-    expect(fmt("m", { type: "tokenProfile", status: "approved" }, false)).not.toContain("Paid:");
+    const fmt = makeOrderFormatter(() => ({ creator: "c", launchCount: 1 }));
+    expect(fmt("m", { type: "tokenProfile", status: "approved" }, false)).not.toContain("Paid");
   });
 });

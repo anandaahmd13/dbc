@@ -64,6 +64,17 @@ async function main() {
     ? new DryRunSender()
     : new TelegramClient(cfg.telegramBotToken, cfg.telegramChatId);
 
+  // Switching from a dry run to live: messages that were only logged are still
+  // queued as 'dryrun'. Re-queue them once, re-checked against creator verdicts.
+  if (!cfg.dryRun) {
+    const r = db.releaseDryRun();
+    if (r.released || r.held) {
+      log.info(
+        `live mode: re-queued ${r.released} message(s) logged during dry run, ${r.held} held for creator verification`
+      );
+    }
+  }
+
   // --- launch handler ---
   // Record the launch and start monitoring immediately. The creator check (a
   // heavy RPC scan) runs in its own worker; until it proves the creator has

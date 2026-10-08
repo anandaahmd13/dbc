@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { paidMarker } from "./age.js";
 import { readFileSync, readdirSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -295,21 +296,8 @@ export class Db {
         )
         .run(params.eventKey, params.baseMint, params.kind, now);
       if (ins.changes === 0) return false;
-      // Fail closed: only send when BOTH the launch and its creator's verdict say
-      // eligible. Anything else (unverified, unknown, no row) parks the message;
-      // verification later releases or drops it. Checking the creators table, not
-      // just a per-launch flag, means a verdict that is later reset to unknown
-      // (or a launch row from before this check existed) cannot leak an alert.
-      const gate = this.raw
-        .prepare(
-          `SELECT l.eligible AS eligible, l.pending_creator AS pending, c.eligibility AS verdict
-           FROM launches l LEFT JOIN creators c ON c.address = l.creator
-           WHERE l.base_mint = ?`
-        )
-        .get(params.baseMint) as
-        | { eligible: number; pending: number; verdict: string | null }
-        | undefined;
-      const hold = !(gate && gate.pending === 0 && gate.eligible === 1 && gate.verdict === "eligible");
+      // Fail closed: only a launch whose creator is proven eligible may send.
+      const hold = !this.isVerified(params.baseMint);
       this.raw
         .prepare(
           `INSERT OR IGNORE INTO outbox
@@ -327,6 +315,23 @@ export class Db {
       return true;
     });
     return tx();
+  }
+
+  /**
+   * True only when the launch AND its creator's current verdict are both
+   * eligible. Checking the creators table, not just a per-launch flag, means a
+   * verdict later reset to unknown (or a launch row from before this check
+   * existed) cannot leak an alert.
+   */
+  private isVerified(mint: string): boolean {
+    const gate = this.raw
+      .prepare(
+        `SELECT l.eligible AS eligible, l.pending_creator AS pending, c.eligibility AS verdict
+         FROM launches l LEFT JOIN creators c ON c.address = l.creator
+         WHERE l.base_mint = ?`
+      )
+      .get(mint) as { eligible: number; pending: number; verdict: string | null } | undefined;
+    return Boolean(gate && gate.pending === 0 && gate.eligible === 1 && gate.verdict === "eligible");
   }
 
   /**
@@ -437,14 +442,42 @@ export class Db {
     this.raw.prepare("UPDATE outbox SET status = 'dryrun' WHERE id = ?").run(id);
   }
 
-  /** Re-queue messages that were only logged in dry-run, for real delivery. */
-  releaseDryRun(): number {
-    return this.raw
-      .prepare(
-        `UPDATE outbox SET status = 'pending', next_attempt_at = 0
-         WHERE status = 'dryrun'`
-      )
-      .run().changes;
+  /**
+   * Going live: re-queue messages that were only logged during a dry run.
+   *
+   * Each is re-checked against the CURRENT creator verdict (it may have changed
+   * since it was logged) and parked as 'held' if no longer proven. An age line
+   * frozen into the text by older code is replaced with a send-time marker built
+   * from the order's real payment time, or removed if that is unknown, so a
+   * message sent hours later cannot claim the payment was "1 min ago".
+   */
+  releaseDryRun(): { released: number; held: number } {
+    const rows = this.raw
+      .prepare("SELECT id, base_mint, text FROM outbox WHERE status = 'dryrun'")
+      .all() as { id: number; base_mint: string | null; text: string }[];
+    const upd = this.raw.prepare(
+      "UPDATE outbox SET status = ?, hold_reason = ?, text = ?, next_attempt_at = 0 WHERE id = ?"
+    );
+    const latestPaid = this.raw.prepare(
+      `SELECT MAX(payment_ts) AS ts FROM orders
+       WHERE base_mint = ? AND order_type = 'tokenProfile' AND payment_ts > 0`
+    );
+    let released = 0;
+    let held = 0;
+    this.raw.transaction(() => {
+      for (const r of rows) {
+        const ok = r.base_mint ? this.isVerified(r.base_mint) : false;
+        let text = r.text;
+        if (/^Paid: .*$/m.test(text)) {
+          const ts = r.base_mint ? (latestPaid.get(r.base_mint) as { ts: number | null }).ts : null;
+          text = ts ? text.replace(/^Paid: .*$/m, paidMarker(ts)) : text.replace(/^Paid: .*\n?/m, "");
+        }
+        upd.run(ok ? "pending" : "held", ok ? null : "creator_unverified", text, r.id);
+        if (ok) released++;
+        else held++;
+      }
+    })();
+    return { released, held };
   }
 
   markOutboxSent(id: number): void {

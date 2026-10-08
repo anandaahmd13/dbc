@@ -2,6 +2,7 @@ import type { Db } from "./db.js";
 import type { TelegramSender } from "./telegram.js";
 import { TelegramError } from "./telegram.js";
 import { log } from "./logger.js";
+import { resolvePaidAge } from "./age.js";
 import { sleep } from "./scheduler.js";
 
 const MAX_ATTEMPTS = 8;
@@ -33,7 +34,7 @@ export class OutboxWorker {
     const batch = this.db.claimPendingOutbox(now, 10);
     for (const row of batch) {
       try {
-        const result = await this.sender.send(row.text);
+        const result = await this.sender.send(resolvePaidAge(row.text, Date.now()));
         // A dry run only logged the text. Marking it 'sent' would burn the alert
         // forever (its event key is already recorded), so keep it recoverable.
         if (result === "dryrun") this.db.markOutboxDryRun(row.id);

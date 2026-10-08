@@ -59,7 +59,9 @@ export class DryRunSender implements TelegramSender {
 
 /** Escape text for Telegram HTML parse mode. */
 export function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // \u0001 delimits internal age markers (see age.ts); never let token-controlled
+  // text carry one.
+  return s.replace(/\u0001/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 const TELEGRAM_MAX = 4096;
